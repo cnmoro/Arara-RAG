@@ -87,6 +87,7 @@ class Arara:
 
         self._doc_ids: list[str] = []
         self._doc_text: dict[str, str] = {}
+        self._doc_to_chunks: dict[str, list[int]] = {}
         self._chunks: list[Chunk] = []
         self._chunk_doc_idx = np.empty(0, dtype=np.int64)
         self._dense: DenseIndex | None = None
@@ -138,9 +139,12 @@ class Arara:
             self._doc_ids.append(doc_id)
             canonical = canonicalize(text)
             self._doc_text[doc_id] = canonical
+            idxs: list[int] = []
             for chunk in self.chunker.split(doc_id, canonical):
+                idxs.append(len(new_chunks))
                 new_chunks.append(chunk)
                 new_doc_idx.append(base)
+            self._doc_to_chunks[doc_id] = idxs
         self.timings["chunk_s"] = time.perf_counter() - t0
         if not new_chunks:
             return 0
@@ -293,6 +297,67 @@ class Arara:
     def retrieve_ranking(self, query: str, depth: int = 100, mode: SearchMode = "hybrid") -> list[str]:
         """Ranked doc ids, for benchmark harnesses."""
         return [h.doc_id for h in self.search(query, top_k=depth, mode=mode)]
+
+    def score_documents(
+        self, query: str, doc_ids, mode: str = "lexical"
+    ) -> dict[str, float]:
+        """Score a fixed candidate set of documents for ``query``.
+
+        This is the reranking path: the candidate list is given, and only the
+        order within it is decided. A document's score is the best score among
+        its chunks. Documents with no indexed chunks score ``-inf``.
+
+        ``mode="hybrid"`` fuses the dense and lexical *document* rankings with
+        RRF, using :attr:`fusion_weights`.
+        """
+        ids = list(dict.fromkeys(str(d) for d in doc_ids))
+        chunk_map = {d: self._doc_to_chunks.get(d, []) for d in ids}
+        out = {d: float("-inf") for d in ids}
+        present = {d: cs for d, cs in chunk_map.items() if cs}
+        if not present:
+            return out
+
+        dense_scores = lex_scores = cxm25_scores = None
+        if mode in ("dense", "hybrid"):
+            dense_scores = self._dense.score_all(self.encoder.encode([query])[0])  # type: ignore[union-attr]
+        if mode in ("lexical", "hybrid"):
+            lex_scores = self._lex.score_all(self.tokenizer.terms(query))
+        if mode == "cxm25":
+            if self._cxm25 is None:
+                self.finalize(build_cxm25=True)
+            flat = [c for cs in present.values() for c in cs]
+            vals = self._cxm25.score_candidates(query, flat)  # type: ignore[union-attr]
+            cxm25_scores = dict(zip(flat, (float(v) for v in vals)))
+
+        if mode == "cxm25":
+            for d, cs in present.items():
+                out[d] = max(cxm25_scores[c] for c in cs)  # type: ignore[index]
+        elif mode == "hybrid":
+            d_doc = {d: max(float(dense_scores[c]) for c in cs) for d, cs in present.items()}  # type: ignore[index]
+            l_doc = {d: max(float(lex_scores[c]) for c in cs) for d, cs in present.items()}  # type: ignore[index]
+            d_rank = {d: r for r, d in enumerate(sorted(d_doc, key=lambda x: -d_doc[x]), 1)}
+            l_rank = {d: r for r, d in enumerate(sorted(l_doc, key=lambda x: -l_doc[x]), 1)}
+            dw, lw = self.fusion_weights
+            for d in present:
+                out[d] = dw / (self.rrf_k + d_rank[d]) + lw / (self.rrf_k + l_rank[d])
+        elif mode == "dense":
+            for d, cs in present.items():
+                out[d] = max(float(dense_scores[c]) for c in cs)  # type: ignore[index]
+        elif mode == "lexical":
+            for d, cs in present.items():
+                out[d] = max(float(lex_scores[c]) for c in cs)  # type: ignore[index]
+        else:
+            raise ValueError(f"unknown scoring mode: {mode!r}")
+        return out
+
+    def rerank(
+        self, query: str, doc_ids, mode: str = "cxm25", top_k: int | None = None
+    ) -> list[str]:
+        """Return ``doc_ids`` reordered best-first. Unscorable docs go last."""
+        scores = self.score_documents(query, doc_ids, mode=mode)
+        order = sorted(scores.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        ranked = [d for d, _ in order]
+        return ranked[:top_k] if top_k else ranked
 
     # -- introspection ------------------------------------------------------
     def stats(self) -> dict:

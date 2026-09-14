@@ -108,14 +108,14 @@ class BM25Index:
         self._doc_lens = lens  # type: ignore[assignment]
         return self
 
-    def search(self, terms, top_k: int = 100):
-        """Return ``(scores, doc_indices)`` for the top ``top_k`` documents."""
+    def score_all(self, terms) -> np.ndarray:
+        """BM25 score of every document, in index order."""
         if self._indptr is None:
             self.finalize()
-        n = int(self._doc_lens.shape[0]) if isinstance(self._doc_lens, np.ndarray) else 0
-        if n == 0:
-            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int64)
+        n = self._n_docs
         scores = np.zeros(n, dtype=np.float32)
+        if n == 0:
+            return scores
         k1, b, avgdl = self.k1, self.b, self._avgdl
         for term in set(terms):
             tid = self._vocab.get(term)
@@ -129,6 +129,14 @@ class BM25Index:
             dl = self._doc_lens[docs]
             denom = tf + k1 * (1.0 - b + b * dl / avgdl)
             scores[docs] += self._idf[tid] * (tf * (k1 + 1.0)) / denom
+        return scores
+
+    def search(self, terms, top_k: int = 100):
+        """Return ``(scores, doc_indices)`` for the top ``top_k`` documents."""
+        scores = self.score_all(terms)
+        n = scores.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int64)
         k = min(top_k, n)
         part = np.argpartition(-scores, k - 1)[:k] if k < n else np.arange(n)
         cand_s = scores[part]

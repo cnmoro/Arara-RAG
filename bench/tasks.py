@@ -169,3 +169,70 @@ TASK_LOADERS = {
     "juristcu": load_juris_tcu,
     "quati": load_quati,
 }
+
+
+# --------------------------------------------------------------------------
+# reranking tasks
+# --------------------------------------------------------------------------
+RERANK_QUATI_REPO, RERANK_QUATI_REV = (
+    "MTEB-BR/quati-reranking",
+    "68d40ca9a44e8ea0704fb628f31ace070c16bdbc",
+)
+RERANK_JURIS_REPO, RERANK_JURIS_REV = (
+    "MTEB-BR/juristcu-reranking",
+    "83d1eec1aac2ba4e639d72c32a34b4efe70aef82",
+)
+
+
+@dataclass
+class RerankingTask:
+    """A reranking task: candidate lists are given, only order is decided."""
+
+    name: str
+    corpus: dict[str, dict[str, str]]
+    queries: dict[str, str]
+    qrels: dict[str, dict[str, int]]
+    candidates: dict[str, list[str]]
+    main_score: str = "map_at_1000"
+
+
+def _load_reranking(repo: str, revision: str, name: str) -> RerankingTask:
+    from datasets import load_dataset
+
+    corpus = {
+        str(r["_id"]): {"text": r["text"], "title": r.get("title") or ""}
+        for r in load_dataset(repo, "corpus", split="test", revision=revision)
+    }
+    queries = {
+        str(r["_id"]): r["text"]
+        for r in load_dataset(repo, "queries", split="test", revision=revision)
+    }
+    qrels: dict[str, dict[str, int]] = {}
+    for r in load_dataset(repo, "qrels", split="test", revision=revision):
+        qrels.setdefault(str(r["query-id"]), {})[str(r["corpus-id"])] = int(r["score"])
+    candidates: dict[str, list[str]] = {}
+    for r in load_dataset(repo, "top_ranked", split="test", revision=revision):
+        candidates[str(r["query-id"])] = [str(d) for d in r["corpus-ids"]]
+
+    qids = [q for q in queries if q in qrels and candidates.get(q)]
+    return RerankingTask(
+        name=name,
+        corpus=corpus,
+        queries={q: queries[q] for q in qids},
+        qrels={q: qrels[q] for q in qids},
+        candidates={q: candidates[q] for q in qids},
+    )
+
+
+def load_quati_reranking() -> RerankingTask:
+    return _load_reranking(RERANK_QUATI_REPO, RERANK_QUATI_REV, "QuatiReranking")
+
+
+def load_juristcu_reranking() -> RerankingTask:
+    return _load_reranking(RERANK_JURIS_REPO, RERANK_JURIS_REV, "JurisTCUReranking")
+
+
+RERANK_LOADERS = {
+    "quati_reranking": load_quati_reranking,
+    "juristcu_reranking": load_juristcu_reranking,
+}

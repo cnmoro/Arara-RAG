@@ -57,6 +57,40 @@ def mrr_at_k(ranked: list[str], qrels: dict[str, int], k: int) -> float:
     return 0.0
 
 
+def average_precision_at_k(ranked: list[str], qrels: dict[str, int], k: int) -> float:
+    """Average precision at cut ``k``, matching trec_eval's ``map_cut``.
+
+    The denominator is the total number of judged-relevant documents, not the
+    number retrieved -- the convention MTEB reranking scores rely on.
+    """
+    relevant = {d for d, v in qrels.items() if v > 0}
+    if not relevant:
+        return 0.0
+    hits = 0
+    total = 0.0
+    for i, doc_id in enumerate(ranked[:k], start=1):
+        if doc_id in relevant:
+            hits += 1
+            total += hits / i
+    return total / len(relevant)
+
+
+def evaluate_reranking(
+    rankings: dict[str, list[str]],
+    qrels: dict[str, dict[str, int]],
+    k: int = 1000,
+) -> dict[str, float]:
+    """Aggregate MAP for reranking tasks (MTEB-BR's main score)."""
+    qids = [q for q in rankings if qrels.get(q)]
+    if not qids:
+        return {}
+    aps = [average_precision_at_k(rankings[q], qrels[q], k) for q in qids]
+    return {
+        f"map_at_{k}": sum(aps) / len(aps),
+        "n_queries": float(len(qids)),
+    }
+
+
 def evaluate(
     rankings: dict[str, list[str]],
     qrels: dict[str, dict[str, int]],

@@ -45,6 +45,10 @@ thing installs in **200 MB**.
 | Rerank | [`CXM25`](https://github.com/cnmoro/CXM25) — BM25-inspired lexical scoring with a PT-BR stemmer | bundled | cnmoro |
 | Fusion | Reciprocal Rank Fusion | — | this repo |
 
+Also included, both written here against the same index: an exact numpy vector
+index and a BM25 inverted index, plus a `rerank()` / `score_documents()` API for
+scoring a fixed candidate set.
+
 Nothing here needs a GPU, a tokenizer model server, or a transformer runtime.
 A static embedding model is a lookup table, so encoding is tokenize-then-lookup
 and search is one matrix multiply.
@@ -131,6 +135,29 @@ What this says:
 
 CXM25 improves every task it was tried on, for 1–6 ms per query.
 
+### Reranking tasks: MAP@1000
+
+MTEB-BR's reranking tasks hand you a fixed candidate list per query (BM25 hard
+negatives) and score only the resulting order, so `identity` is the baseline the
+benchmark ships with:
+
+| Task | identity (given order) | dense | lexical | hybrid | **CXM25** |
+|---|---|---|---|---|---|
+| QuatiReranking | 0.2839 | 0.2798 | 0.2939 | 0.3066 | **0.3100** |
+| JurisTCUReranking | 0.4150 | 0.3609 | 0.4279 | 0.4129 | **0.4845** |
+
+CXM25 is the best of arara's rerankers on both tasks, and the only one that beats
+the given order on both. Two things worth stating plainly:
+
+- **Dense reranking actively hurts** on JurisTCU (0.4150 → 0.3609). Reranking
+  discards the lexical safety net that RRF provides during retrieval, so a weak
+  semantic scorer does more damage here than in the retrieval tables above.
+- **Against purpose-built rerankers arara is not competitive.** The best
+  cross-encoder on the public board (`voyage/rerank-2.5`) scores 0.7560 and
+  0.6516 on these two tasks; CXM25 lands at the 11th and 38th percentile. A
+  lexical reranker is a cheap improvement over a BM25 order, not a replacement
+  for a cross-encoder.
+
 ### A negative result: the fusion weights
 
 Equal-weight RRF loses to lexical-only everywhere, so the weights were swept
@@ -196,16 +223,18 @@ cannot represent at all.
    lexical moves a single task by at most 0.11.
 2. **The learned chunker earns its keep where formatting heuristics fail.**
    Paragraph splitting tied fixed windows exactly; tinyzchunk did not.
-3. **The static dense model does not earn its place on these tasks**, and the
-   fusion sweep is the evidence. That is worth fixing — a better PT-BR dense
-   model is the single highest-leverage change to this stack.
+3. **CXM25 is the component that pays for itself**, improving every retrieval
+   task and beating the given BM25 order on both reranking tasks.
+4. **The static dense model does not earn its place on these tasks**, and the
+   fusion sweep plus the dense-reranking regression are the evidence. A better
+   PT-BR dense model is the single highest-leverage change to this stack.
 
 ---
 
 ## Guarantees
 
 The chunker's contract is enforced by tests, not asserted in prose
-(`tests/test_arara.py`):
+(`tests/`):
 
 - every chunk is an **exact substring** of the canonical document;
 - chunks are ordered and non-overlapping;
@@ -235,9 +264,10 @@ the vectorised path against a literal implementation of the BM25 formula.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[bench]"
-python -m pytest tests/                     # 58 tests
+python -m pytest tests/                     # 69 tests
 python bench/validate_metrics.py            # needs pytrec_eval-terrier
-HF_HOME=$PWD/.cache/hf ./bench/run_all.sh   # all suites -> bench/results/
+HF_HOME=$PWD/.cache/hf ./bench/run_all.sh   # retrieval suites -> bench/results/
+python -m bench.rerank                      # reranking suites (MAP@1000)
 python -m bench.report --readme             # the tables above
 python -m bench.leaderboard                 # comparison against MTEB-BR
 ```
@@ -265,11 +295,13 @@ arara_rag/
   cli.py        python -m arara_rag search
 bench/
   tasks.py      MTEB-BR task loaders (pinned revisions)
-  metrics.py    nDCG / recall / MRR matching pytrec_eval
-  run.py        experiment suites
+  metrics.py    nDCG / recall / MRR / MAP matching pytrec_eval
+  run.py        retrieval experiment suites
+  rerank.py     reranking experiment suite (MAP@1000)
   leaderboard.py  comparison against the public leaderboard
   report.py     markdown tables
 tests/          contract and correctness tests
+space/          Gradio demo for the HuggingFace Space
 ```
 
 ---

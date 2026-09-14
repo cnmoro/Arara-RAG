@@ -1,0 +1,2 @@
+arara-rag @ git+https://github.com/cnmoro/arara-rag.git
+gradio>=4.0

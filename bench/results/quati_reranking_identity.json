@@ -1,0 +1,14 @@
+{
+  "experiment": "quati_reranking_identity",
+  "task": "quati_reranking",
+  "task_name": "QuatiReranking",
+  "mode": "identity",
+  "chunk": "window",
+  "corpus_docs": 5991,
+  "queries": 50,
+  "chunks": 5991,
+  "index_build_s": 40.64,
+  "ms_per_query": 0.0,
+  "map_at_1000": 0.2839,
+  "n_queries": 50.0
+}

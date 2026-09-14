@@ -90,6 +90,14 @@ class DenseIndex:
             )
         return self._matrix32
 
+    def score_all(self, query: np.ndarray) -> np.ndarray:
+        """Similarity of every vector to ``query``, in index order."""
+        matrix = self._searchable()
+        if matrix is None:
+            return np.empty(0, dtype=np.float32)
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        return (matrix @ q).astype(np.float32, copy=False)
+
     def search(self, query: np.ndarray, top_k: int = 100, block: int = 65536):
         """Return ``(scores, indices)`` for the top ``top_k`` vectors."""
         matrix = self._searchable()

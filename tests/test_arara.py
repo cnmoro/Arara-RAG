@@ -246,6 +246,49 @@ def test_crlf_document_offsets_resolve_after_canonicalisation() -> None:
         assert a.resolve(h) == h.text
 
 
+def test_rerank_orders_a_fixed_candidate_set() -> None:
+    """Reranking must only reorder; the candidate set is preserved exactly."""
+    a = Arara()
+    a.add_documents(
+        {
+            "trib": "A alíquota do imposto de renda é progressiva e chega a 27,5%.",
+            "amb": "O licenciamento ambiental é um instrumento preventivo.",
+            "outro": "Assunto completamente diferente sobre culinária.",
+        }
+    )
+    a.finalize()
+    candidates = ["outro", "amb", "trib"]
+    for mode in ("lexical", "dense", "hybrid", "cxm25"):
+        ranked = a.rerank("qual a alíquota do imposto de renda?", candidates, mode=mode)
+        assert ranked[0] == "trib", mode
+        assert sorted(ranked) == sorted(candidates), mode
+
+
+def test_rerank_puts_unscorable_documents_last() -> None:
+    a = Arara()
+    a.add_documents({"known": "conteúdo sobre tributos"})
+    a.finalize()
+    ranked = a.rerank("tributos", ["ausente", "known"], mode="lexical")
+    assert ranked[-1] == "ausente"
+
+
+def test_score_documents_takes_the_best_chunk() -> None:
+    a = Arara(max_chunk_chars=80, min_chunk_chars=10)
+    a.add_documents(
+        {
+            "longo": (
+                "Introdução sobre um assunto qualquer que não interessa.\n\n"
+                "A alíquota do imposto de renda é de vinte e sete vírgula cinco por cento.\n\n"
+                "Conclusão irrelevante sobre outro tema completamente distinto."
+            )
+        }
+    )
+    a.finalize()
+    scores = a.score_documents("alíquota do imposto de renda", ["longo"], mode="lexical")
+    assert scores["longo"] > 0
+    assert a.n_chunks > 1, "expected the document to be split"
+
+
 def test_duplicate_doc_id_rejected() -> None:
     a = Arara()
     a.add_documents({"x": "texto"})

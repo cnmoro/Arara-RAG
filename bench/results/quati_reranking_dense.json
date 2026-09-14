@@ -1,0 +1,14 @@
+{
+  "experiment": "quati_reranking_dense",
+  "task": "quati_reranking",
+  "task_name": "QuatiReranking",
+  "mode": "dense",
+  "chunk": "window",
+  "corpus_docs": 5991,
+  "queries": 50,
+  "chunks": 5991,
+  "index_build_s": 40.64,
+  "ms_per_query": 4.06,
+  "map_at_1000": 0.2798,
+  "n_queries": 50.0
+}

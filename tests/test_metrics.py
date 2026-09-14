@@ -6,7 +6,14 @@ import math
 
 import pytest
 
-from bench.metrics import evaluate, mrr_at_k, ndcg_at_k, recall_at_k
+from bench.metrics import (
+    average_precision_at_k,
+    evaluate,
+    evaluate_reranking,
+    mrr_at_k,
+    ndcg_at_k,
+    recall_at_k,
+)
 
 
 def test_ndcg_uses_linear_gain() -> None:
@@ -53,3 +60,29 @@ def test_evaluate_skips_queries_without_qrels() -> None:
     out = evaluate(rankings, qrels, k_values=(10,))
     assert out["n_queries"] == 1.0
     assert out["ndcg_at_10"] == pytest.approx(1.0)
+
+
+def test_average_precision_hand_computed() -> None:
+    """AP denominator is the number of relevant docs, not the number retrieved."""
+    qrels = {"a": 1, "b": 1, "c": 1}
+    ranked = ["a", "x", "b", "y", "c"]
+    # precision at 1 = 1, at 3 = 2/3, at 5 = 3/5
+    expected = (1.0 + 2 / 3 + 3 / 5) / 3
+    assert average_precision_at_k(ranked, qrels, 1000) == pytest.approx(expected)
+
+
+def test_average_precision_edges() -> None:
+    assert average_precision_at_k(["a"], {"a": 1}, 1000) == pytest.approx(1.0)
+    assert average_precision_at_k(["x", "y"], {"a": 1}, 1000) == 0.0
+    assert average_precision_at_k([], {"a": 1}, 1000) == 0.0
+    assert average_precision_at_k(["a"], {}, 1000) == 0.0
+    # a relevant document beyond the cut is not credited
+    assert average_precision_at_k(["x", "a"], {"a": 1}, 1) == 0.0
+
+
+def test_evaluate_reranking_aggregates_map() -> None:
+    rankings = {"q1": ["a", "b"], "q2": ["b", "a"]}
+    qrels = {"q1": {"a": 1}, "q2": {"a": 1}}
+    out = evaluate_reranking(rankings, qrels, k=1000)
+    assert out["map_at_1000"] == pytest.approx((1.0 + 0.5) / 2)
+    assert out["n_queries"] == 2.0

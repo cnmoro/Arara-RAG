@@ -28,6 +28,18 @@ CACHE = Path(__file__).parent.parent / ".cache" / "mteb-br-results"
 
 RETRIEVAL_TASKS = ["Quati", "JurisTCU", "BRTaxQAR", "FaQuADIR", "FaqBacenRetrieval", "MedPTRetrieval"]
 
+# Task -> the metric MTEB-BR uses as that task's main score.
+MAIN_SCORE = {
+    "Quati": "ndcg_at_10",
+    "JurisTCU": "ndcg_at_10",
+    "BRTaxQAR": "ndcg_at_10",
+    "FaQuADIR": "ndcg_at_10",
+    "FaqBacenRetrieval": "ndcg_at_10",
+    "MedPTRetrieval": "ndcg_at_10",
+    "QuatiReranking": "map_at_1000",
+    "JurisTCUReranking": "map_at_1000",
+}
+
 # arara experiment prefix -> leaderboard task name
 TASK_MAP = {
     "quati": "Quati",
@@ -35,11 +47,16 @@ TASK_MAP = {
     "brtaxqa_capped": "BRTaxQAR",
     "faquadir": "FaQuADIR",
     "faq_bacen": "FaqBacenRetrieval",
+    "quati_reranking": "QuatiReranking",
+    "juristcu_reranking": "JurisTCUReranking",
 }
+
+RETRIEVAL_ORDER = RETRIEVAL_TASKS
+RERANK_ORDER = ["QuatiReranking", "JurisTCUReranking"]
 
 
 def fetch_leaderboard() -> dict[str, dict[str, float]]:
-    """Return ``{task_name: {model_name: ndcg_at_10}}``."""
+    """Return ``{task_name: {model_name: main_score}}``."""
     from huggingface_hub import snapshot_download
 
     root = snapshot_download(
@@ -48,7 +65,7 @@ def fetch_leaderboard() -> dict[str, dict[str, float]]:
         allow_patterns=["results/*/*/*.json"],
         local_dir=str(CACHE),
     )
-    out: dict[str, dict[str, float]] = {t: {} for t in RETRIEVAL_TASKS}
+    out: dict[str, dict[str, float]] = {t: {} for t in MAIN_SCORE}
     for path in Path(root).glob("results/*/*/*.json"):
         model = path.parent.parent.name.replace("__", "/")
         task = path.stem
@@ -56,7 +73,7 @@ def fetch_leaderboard() -> dict[str, dict[str, float]]:
             continue
         try:
             data = json.loads(path.read_text())
-            score = data["scores"]["test"][0]["ndcg_at_10"]
+            score = data["scores"]["test"][0][MAIN_SCORE[task]]
         except (KeyError, IndexError, json.JSONDecodeError):
             continue
         out[task][model] = float(score)
@@ -64,18 +81,24 @@ def fetch_leaderboard() -> dict[str, dict[str, float]]:
 
 
 def arara_scores() -> dict[str, dict[str, float]]:
-    """Return ``{task_name: {experiment: ndcg_at_10}}`` from local results."""
+    """Return ``{task_name: {experiment: main_score}}`` from local results."""
     out: dict[str, dict[str, float]] = {}
     if not RESULTS_DIR.exists():
         return out
     for path in sorted(RESULTS_DIR.glob("*.json")):
-        rec = json.loads(path.read_text())
-        if not isinstance(rec, dict) or "ndcg_at_10" not in rec:
+        try:
+            rec = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
             continue
         task = TASK_MAP.get(rec.get("task", ""))
         if task is None:
             continue
-        out.setdefault(task, {})[rec["experiment"]] = float(rec["ndcg_at_10"])
+        metric = MAIN_SCORE[task]
+        if metric not in rec:
+            continue
+        out.setdefault(task, {})[rec["experiment"]] = float(rec[metric])
     return out
 
 
@@ -83,14 +106,15 @@ def main() -> None:
     lb = fetch_leaderboard()
     ours = arara_scores()
 
-    print("# MTEB-BR retrieval comparison (nDCG@10)\n")
+    print("# MTEB-BR comparison\n")
+    print("## Retrieval (nDCG@10)\n")
     header = (
         "| Task | arara best | arara mode | leaderboard best | score | "
         "leaderboard median | models | arara percentile |"
     )
     print(header)
     print("|" + "|".join(["---"] * 8) + "|")
-    for task in RETRIEVAL_TASKS:
+    for task in RETRIEVAL_ORDER:
         models = lb.get(task, {})
         mine = ours.get(task, {})
         if not mine:
@@ -106,23 +130,45 @@ def main() -> None:
             pct = 100.0 * sum(1 for s in sorted_scores if s < best_val) / len(sorted_scores)
             print(
                 f"| {task} | {best_val:.4f} | {mode} | {best_model} | {best_lb:.4f} | "
-                f"{median:.4f} | {len(models)} | {pct:.0f}th |"
+                f"{median:.4f} | {len(models)} | {pct:.0f}th pct |"
             )
         else:
             print(f"| {task} | {best_val:.4f} | {mode} | - | - | - | 0 | - |")
 
+    print("\n## Reranking (MAP@1000)\n")
+    print("| Task | arara best | mode | leaderboard best | score | models | percentile |")
+    print("|---|---|---|---|---|---|---|")
+    for task in RERANK_ORDER:
+        models = lb.get(task, {})
+        mine = ours.get(task, {})
+        if not mine:
+            continue
+        best_exp = max(mine, key=lambda k: mine[k])
+        best_val = mine[best_exp]
+        mode = best_exp.split("_")[-1]
+        vals = sorted(models.values())
+        if vals:
+            best_model = max(models, key=lambda k: models[k])
+            pct = 100.0 * sum(1 for s in vals if s < best_val) / len(vals)
+            print(
+                f"| {task} | {best_val:.4f} | {mode} | {best_model} | {models[best_model]:.4f} | "
+                f"{len(vals)} | {pct:.0f}th pct |"
+            )
+        else:
+            print(f"| {task} | {best_val:.4f} | {mode} | - | - | 0 | - |")
+
     print("\n## Where each arara mode lands\n")
     print("| Task | dense (pct) | lexical (pct) | hybrid (pct) |")
     print("|---|---|---|---|")
-    for task in RETRIEVAL_TASKS:
+    for task in RETRIEVAL_ORDER:
         models = lb.get(task, {})
         mine = ours.get(task, {})
         if not mine or not models:
             continue
         vals = sorted(models.values())
 
-        def pct_of(v: float) -> str:
-            pct = 100.0 * sum(1 for s in vals if s < v) / len(vals)
+        def pct_of(v: float, _vals=vals) -> str:
+            pct = 100.0 * sum(1 for s in _vals if s < v) / len(_vals)
             return f"{v:.4f} ({pct:.0f}th pct)"
 
         cells = []
