@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arara-rag"
-version = "0.3.0"
+version = "0.4.0"
 description = "Portuguese-first, CPU-only retrieval: tinyzchunk chunking, static embeddings, BM25, rank fusion and CXM25 reranking. numpy only, out-of-core, with metadata filtering and CRUD."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Carlo Moro" }]
 keywords = ["rag", "retrieval", "portuguese", "pt-br", "embeddings", "bm25", "cpu", "numpy", "out-of-core"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: Apache Software License",
   "Topic :: Text Processing :: Indexing",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -22,7 +22,7 @@ dependencies = [
   "numpy>=1.23",
   "tokenizers>=0.20",
   "model2vec>=0.9",
-  "tinyzchunk>=0.3.2",
+  "tinyzchunk>=0.3.3",
   "cxm25>=0.1.0",
   # Index build is per-document and runs in a process pool. Without a thread
   # cap, OpenBLAS gives every worker a full thread team and the oversubscription

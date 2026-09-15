@@ -5,8 +5,7 @@ lexical retrieval, rank fusion and reranking — numpy only. No PyTorch, no ONNX
 Runtime, no FAISS. The whole install is **200 MB**.
 
 ```bash
-git clone https://github.com/cnmoro/Arara-RAG.git && cd Arara-RAG
-pip install -e .
+pip install arara-rag
 ```
 
 ```python
