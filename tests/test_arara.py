@@ -324,3 +324,41 @@ def test_importing_the_package_does_not_import_torch() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert "clean" in out.stdout
+
+
+# --------------------------------------------------------------------------
+# dense encoder backends
+# --------------------------------------------------------------------------
+def test_encoder_registry_and_defaults() -> None:
+    from arara_rag import ENCODER_BACKENDS, StaticDenseEncoder, build_encoder
+
+    assert set(ENCODER_BACKENDS) == {"static", "use"}
+    assert isinstance(build_encoder("static"), StaticDenseEncoder)
+    with pytest.raises(ValueError):
+        build_encoder("nope")
+
+
+def test_use_encoder_is_numpy_only_and_512d() -> None:
+    """The USE backend must stay torch-free and produce normalized 512-d vectors."""
+    pytest.importorskip("usem3")
+    from arara_rag import USEDenseEncoder
+
+    enc = USEDenseEncoder()
+    assert enc.dim == 512
+    vecs = enc.encode(["o gato preto correu pelo jardim", "a menina lê um livro"])
+    assert vecs.shape == (2, 512)
+    assert np.allclose(np.linalg.norm(vecs, axis=1), 1.0, atol=1e-4)
+    import sys
+
+    assert "torch" not in sys.modules
+    assert "onnxruntime" not in sys.modules
+
+
+def test_arara_accepts_dense_backend() -> None:
+    pytest.importorskip("usem3")
+    a = Arara(dense_backend="use")
+    a.add_documents({"d": "A alíquota do imposto de renda é progressiva."})
+    a.finalize()
+    assert a.stats()["dense_backend"] == "use"
+    assert a._dense.dim == 512
+    assert a.search("alíquota do imposto", top_k=1)[0].doc_id == "d"

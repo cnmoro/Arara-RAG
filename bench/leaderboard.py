@@ -20,6 +20,7 @@ implying parity.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -80,12 +81,15 @@ def fetch_leaderboard() -> dict[str, dict[str, float]]:
     return out
 
 
-def arara_scores() -> dict[str, dict[str, float]]:
+def arara_scores(base: Path | None = None) -> dict[str, dict[str, float]]:
     """Return ``{task_name: {experiment: main_score}}`` from local results."""
     out: dict[str, dict[str, float]] = {}
-    if not RESULTS_DIR.exists():
+    root = base or RESULTS_DIR
+    if not root.exists():
         return out
-    for path in sorted(RESULTS_DIR.glob("*.json")):
+    for path in sorted(root.glob("*.json")):
+        if path.name.startswith("leaderboard_comparison"):
+            continue
         try:
             rec = json.loads(path.read_text())
         except json.JSONDecodeError:
@@ -103,8 +107,13 @@ def arara_scores() -> dict[str, dict[str, float]]:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default=None, help="results dir (default bench/results)")
+    args = ap.parse_args()
+    base = Path(args.dir) if args.dir else None
+
     lb = fetch_leaderboard()
-    ours = arara_scores()
+    ours = arara_scores(base)
 
     print("# MTEB-BR comparison\n")
     print("## Retrieval (nDCG@10)\n")
@@ -177,8 +186,9 @@ def main() -> None:
             cells.append(pct_of(mine[exp]) if exp else "-")
         print(f"| {task} | " + " | ".join(cells) + " |")
 
-    cache_path = RESULTS_DIR / "leaderboard_comparison.json"
-    if RESULTS_DIR.exists():
+    cache_root = base or RESULTS_DIR
+    if cache_root.exists():
+        cache_path = cache_root / "leaderboard_comparison.json"
         cache_path.write_text(json.dumps({"leaderboard": lb, "arara": ours}, indent=2))
         print(f"\nwrote {cache_path}")
 

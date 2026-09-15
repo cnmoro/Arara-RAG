@@ -27,6 +27,10 @@ RESULTS_DIR = Path(__file__).parent / "results"
 DEPTH = 100
 
 
+def results_dir_for(encoder: str) -> Path:
+    return RESULTS_DIR / encoder
+
+
 @dataclass
 class Experiment:
     name: str
@@ -91,9 +95,16 @@ SUITES: dict[str, list[Experiment]] = {
 }
 
 # Chunk configurations keyed by the experiment's ``chunk`` field.
-def _build_index(task: RetrievalTask, chunk: str, max_chunk_chars: int) -> tuple[Arara, float, dict]:
+def _build_index(
+    task: RetrievalTask, chunk: str, max_chunk_chars: int, encoder: str = "static"
+) -> tuple[Arara, float, dict]:
     t0 = time.perf_counter()
-    arara = Arara(chunk_mode=chunk, max_chunk_chars=max_chunk_chars, candidate_k=DEPTH)
+    arara = Arara(
+        chunk_mode=chunk,
+        max_chunk_chars=max_chunk_chars,
+        candidate_k=DEPTH,
+        dense_backend=encoder,
+    )
     arara.add_documents({doc_id: d["text"] for doc_id, d in task.corpus.items()})
     arara.finalize()
     build_s = time.perf_counter() - t0
@@ -102,8 +113,9 @@ def _build_index(task: RetrievalTask, chunk: str, max_chunk_chars: int) -> tuple
 
 def run_experiment(
     exp: Experiment,
-    cache: dict[tuple[str, str, int], tuple[Arara, float, dict]],
+    cache: dict[tuple[str, str, int, str], tuple[Arara, float, dict]],
     task_cache: dict[str, RetrievalTask],
+    encoder: str = "static",
 ) -> dict:
     task_key = exp.task
     if task_key not in task_cache:
@@ -111,14 +123,14 @@ def run_experiment(
         task_cache[task_key] = TASK_LOADERS[task_key]()
     task = task_cache[task_key]
 
-    key = (task_key, exp.chunk, exp.max_chunk_chars)
+    key = (task_key, exp.chunk, exp.max_chunk_chars, encoder)
     if key not in cache:
         print(
             f"  building index  task={task_key} chunk={exp.chunk} "
-            f"docs={len(task.corpus)} ...",
+            f"encoder={encoder} docs={len(task.corpus)} ...",
             flush=True,
         )
-        cache[key] = _build_index(task, exp.chunk, exp.max_chunk_chars)
+        cache[key] = _build_index(task, exp.chunk, exp.max_chunk_chars, encoder)
         _, build_s, stats = cache[key]
         print(
             f"    -> {stats['chunks']} chunks in {build_s:.1f}s "
@@ -149,6 +161,7 @@ def run_experiment(
     record = {
         "experiment": exp.name,
         "task": task_key,
+        "dense_backend": encoder,
         "chunk": exp.chunk,
         "mode": exp.mode,
         "dense_weight": exp.dense_weight,
@@ -172,7 +185,13 @@ def run_experiment(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="core", choices=sorted(SUITES) + ["all"])
-    ap.add_argument("--out", default=str(RESULTS_DIR))
+    ap.add_argument(
+        "--encoder",
+        default="static",
+        choices=["static", "use"],
+        help="dense encoder backend: 'static' (Model2Vec) or 'use' (USE-multilingual v3)",
+    )
+    ap.add_argument("--out", default=None, help="defaults to bench/results/<encoder>")
     ap.add_argument("--max-queries", type=int, default=None,
                     help="subsample queries (for smoke runs); reported in output")
     args = ap.parse_args()
@@ -185,11 +204,11 @@ def main() -> None:
     else:
         exps = list({e.name: e for e in exps}.values())
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.out) if args.out else RESULTS_DIR / args.encoder
     out_dir.mkdir(parents=True, exist_ok=True)
 
     task_cache: dict[str, RetrievalTask] = {}
-    cache: dict[tuple[str, str, int], tuple[Arara, float, dict]] = {}
+    cache: dict[tuple[str, str, int, str], tuple[Arara, float, dict]] = {}
     records = []
     for exp in exps:
         print(f"[{exp.name}]", flush=True)
@@ -198,7 +217,7 @@ def main() -> None:
             t = task_cache[exp.task]
             t.queries = dict(list(t.queries.items())[: args.max_queries])
             t.qrels = {q: v for q, v in t.qrels.items() if q in t.queries}
-        rec = run_experiment(exp, cache, task_cache)
+        rec = run_experiment(exp, cache, task_cache, args.encoder)
         if args.max_queries:
             rec["max_queries"] = args.max_queries
         records.append(rec)
@@ -211,6 +230,20 @@ def main() -> None:
 
     summary_path = out_dir / f"summary_{args.suite}.json"
     summary_path.write_text(json.dumps(records, indent=2))
+
+    # Always also write one summary per suite, so that `--suite all` leaves the
+    # same artifacts as running the suites separately. Report tooling reads
+    # summary_core.json / summary_brtaxqa.json / summary_cxm25.json /
+    # summary_sweep.json, not summary_all.json.
+    suite_of = {e.name: name for name, exps in SUITES.items() for e in exps}
+    by_suite: dict[str, list[dict]] = {}
+    for rec in records:
+        suite_name = suite_of.get(rec["experiment"])
+        if suite_name:
+            by_suite.setdefault(suite_name, []).append(rec)
+    for suite_name, recs in by_suite.items():
+        (out_dir / f"summary_{suite_name}.json").write_text(json.dumps(recs, indent=2))
+
     print(f"\nwrote {summary_path}")
 
 

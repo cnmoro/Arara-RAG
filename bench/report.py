@@ -22,8 +22,8 @@ COLUMNS = [
 ]
 
 
-def load(suite: str) -> list[dict]:
-    path = RESULTS_DIR / f"summary_{suite}.json"
+def load(suite: str, base: Path | None = None) -> list[dict]:
+    path = (base or RESULTS_DIR) / f"summary_{suite}.json"
     if not path.exists():
         return []
     return json.loads(path.read_text())
@@ -47,9 +47,9 @@ def render(records: list[dict], title: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def readme_tables() -> str:
+def readme_tables(base: Path | None = None) -> str:
     """Emit the two tables the README embeds, straight from the result JSONs."""
-    core = load("core")
+    core = load("core", base)
     order = ["brtaxqa_capped", "faquadir", "faq_bacen", "juristcu", "quati"]
     names = {"brtaxqa_capped": "BRTaxQAR (capped)", "faquadir": "FaQuADIR",
              "faq_bacen": "FaqBacenRetrieval", "juristcu": "JurisTCU", "quati": "Quati"}
@@ -72,7 +72,7 @@ def readme_tables() -> str:
            "single-chunk documents, so this isolates dense vs lexical vs fusion)\n"]
     out += lines
 
-    ab = load("brtaxqa")
+    ab = load("brtaxqa", base)
     if ab:
         out.append("\n**BRTaxQAR ablation, nDCG@10** — each row changes one thing\n")
         out.append("| Configuration | chunks | nDCG@10 | R@100 |")
@@ -103,12 +103,14 @@ def readme_tables() -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default=None)
+    ap.add_argument("--dir", default=None, help="results dir (default bench/results)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--readme", action="store_true", help="emit the README result tables")
     args = ap.parse_args()
+    base = Path(args.dir) if args.dir else None
 
     if args.readme:
-        text = readme_tables()
+        text = readme_tables(base)
         if args.out:
             Path(args.out).write_text(text)
             print(f"wrote {args.out}")
@@ -119,7 +121,7 @@ def main() -> None:
     suites = [args.suite] if args.suite else ["core", "brtaxqa", "cxm25", "sweep"]
     chunks = []
     for s in suites:
-        recs = load(s)
+        recs = load(s, base)
         if recs:
             chunks.append(render(recs, f"{s} suite ({len(recs)} experiments)"))
     text = "\n".join(chunks)

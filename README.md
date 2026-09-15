@@ -24,6 +24,17 @@ for h in hits[:3]:
 every chunk carries character offsets into the canonical source document — not
 just the chunk text.
 
+The main knobs are the dense encoder and the fusion weights. Both choices are
+measured rather than assumed — see
+[the encoder ablation](#encoder-ablation-static-nomic-vs-universal-sentence-encoder)
+and [the fusion sweep](#a-negative-result-the-fusion-weights). The defaults are
+the static encoder and untuned 1:1 fusion.
+
+```python
+Arara(dense_backend="use")          # USE-multilingual v3, still numpy-only
+Arara(fusion_weights=(1.0, 3.0))    # bias rank fusion toward BM25
+```
+
 ```bash
 python -m arara_rag search "licenciamento ambiental" docs/ --json -k 3
 ```
@@ -40,7 +51,7 @@ thing installs in **200 MB**.
 | Stage | Component | Size | Origin |
 |---|---|---|---|
 | Chunking | [`tinyzchunk`](https://github.com/cnmoro/tinyzchunk) — tokenizer-free, distilled from an LLM teacher | 2.1 MB | cnmoro |
-| Dense | [`static-nomic-384-pten-v2`](https://huggingface.co/cnmoro/static-nomic-384-pten-v2) — Model2Vec static embeddings | 62 MB | cnmoro |
+| Dense | [`static-nomic-384-pten-v2`](https://huggingface.co/cnmoro/static-nomic-384-pten-v2) — Model2Vec static embeddings (or USE-multilingual v3, see the ablation below) | 62 MB | cnmoro / Google |
 | Lexical | BM25 over a numpy inverted index | — | this repo |
 | Rerank | [`CXM25`](https://github.com/cnmoro/CXM25) — BM25-inspired lexical scoring with a PT-BR stemmer | bundled | cnmoro |
 | Fusion | Reciprocal Rank Fusion | — | this repo |
@@ -60,6 +71,8 @@ and search is one matrix multiply.
 | arara-rag, clean venv, 26 packages | **200 MB** |
 | PyTorch alone | 1.6 GB |
 | `torch` + `transformers` + `faiss` (typical RAG stack) | ~4 GB |
+
+The optional USE encoder (`pip install "arara-rag[use]"`) adds 32 MB.
 
 ---
 
@@ -183,6 +196,45 @@ BM25 is strongest and a 384-dimension static model is weakest. Dense retrieval
 should still help on paraphrase-heavy or cross-lingual queries, which none of
 these tasks measure. The default is therefore left untuned at 1:1, and this is
 flagged as the first thing worth investigating on your own data.
+
+### Encoder ablation: static-nomic vs Universal Sentence Encoder
+
+`Arara(dense_backend="use")` swaps in Google's Universal Sentence Encoder
+multilingual v3 — a real encoder (512-d, DAN + CNN n-grams) available as a pure
+numpy port, so still no PyTorch and no ONNX Runtime. It is the obvious challenger
+to a 384-d static model. It loses:
+
+| Task | static dense | USE dense | Δ | static hybrid | USE hybrid | Δ |
+|---|---|---|---|---|---|---|
+| FaQuADIR | **0.7135** | 0.6654 | −0.048 | **0.8304** | 0.8183 | −0.012 |
+| JurisTCU | **0.3887** | 0.2751 | −0.114 | **0.4878** | 0.4508 | −0.037 |
+| BRTaxQAR (capped) | **0.2933** | 0.2515 | −0.042 | 0.3487 | **0.3519** | +0.003 |
+| FaqBacenRetrieval | **0.3745** | 0.3579 | −0.017 | 0.4526 | **0.4562** | +0.004 |
+| Quati | 0.3268 | **0.3802** | **+0.053** | 0.4046 | **0.4357** | **+0.031** |
+
+**Dense retrieval: USE wins 1 of 5 tasks, mean Δ = −0.033.** Hybrid is close to a
+wash (mean Δ = −0.002) — but USE costs far more to index:
+
+| Corpus | chunks | static build | USE build |
+|---|---|---|---|
+| FaQuADIR | 244 | 1.7 s | 3.1 s |
+| BRTaxQAR (capped) | 2,552 | 13.2 s | 119.8 s |
+| JurisTCU | 16,047 | 17.9 s | 72.2 s |
+| Quati | 50,000 | 139 s | 825 s |
+
+Measured encode throughput on ~600-character passages: **7,671 docs/s for the
+static model against 150 docs/s for USE — roughly 50×.** A static model is a
+table lookup; USE computes n-gram embeddings for every text.
+
+The default stays `static`. The split is not random, though, and it is the most
+interesting finding here: **USE wins exactly where the corpus is large and
+general-domain** (Quati, 50k web passages) and loses everywhere the corpus is
+small and domain-specific (tax law, case law, FAQ). It also wins both Quati
+reranking modes — on QuatiReranking, USE dense (0.3474) beats every static mode
+including CXM25 (0.3100).
+
+So `dense_backend="use"` is worth trying if your corpus looks like Quati. It is
+not worth it as a default, and not worth it for legal or FAQ retrieval.
 <!-- RESULTS_END -->
 
 ### Where this stands against the leaderboard
@@ -264,12 +316,13 @@ the vectorised path against a literal implementation of the BM25 formula.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[bench]"
-python -m pytest tests/                     # 69 tests
-python bench/validate_metrics.py            # needs pytrec_eval-terrier
-HF_HOME=$PWD/.cache/hf ./bench/run_all.sh   # retrieval suites -> bench/results/
-python -m bench.rerank                      # reranking suites (MAP@1000)
-python -m bench.report --readme             # the tables above
-python -m bench.leaderboard                 # comparison against MTEB-BR
+python -m pytest tests/                       # 72 tests
+python bench/validate_metrics.py              # needs pytrec_eval-terrier
+./bench/run_all.sh                            # all suites, encoder=static
+./bench/run_all.sh use                        # the same sweep with USE-multilingual
+python -m bench.report --readme               # the tables above
+python -m bench.leaderboard                   # comparison against MTEB-BR
+python -m bench.compare_encoders              # static vs use, side by side
 ```
 
 `bench/validate_metrics.py` is the only script needing `pytrec_eval`; it is the
@@ -298,8 +351,10 @@ bench/
   metrics.py    nDCG / recall / MRR / MAP matching pytrec_eval
   run.py        retrieval experiment suites
   rerank.py     reranking experiment suite (MAP@1000)
+  compare_encoders.py  static vs USE side by side
   leaderboard.py  comparison against the public leaderboard
   report.py     markdown tables
+  results/      raw JSON per encoder (static/, use/)
 tests/          contract and correctness tests
 space/          Gradio demo for the HuggingFace Space
 ```
@@ -309,9 +364,12 @@ space/          Gradio demo for the HuggingFace Space
 ## Limitations
 
 - **PT-BR and English only.** The tokenizer, stemmer and stopwords are
-  Portuguese; the dense model is EN+PT. Other languages will degrade.
+  Portuguese; both dense models are multilingual with EN+PT coverage. Other
+  languages will degrade.
 - **The dense model is small.** It will lose to transformer encoders on
   semantic and paraphrase-heavy queries. Lexical retrieval carries this stack.
+  The USE backend is not a fix for this: it loses to the static model on 4 of 5
+  tasks and costs ~50× more to encode.
 - **The index is in memory.** It is float16 and fast, but there is no
   disk-backed serving path yet.
 - **CXM25 reranking is ~71 µs/document**, so it is applied to a candidate set

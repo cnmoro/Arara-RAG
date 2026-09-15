@@ -1,0 +1,15 @@
+{
+  "experiment": "quati_reranking_hybrid",
+  "task": "quati_reranking",
+  "task_name": "QuatiReranking",
+  "dense_backend": "use",
+  "mode": "hybrid",
+  "chunk": "window",
+  "corpus_docs": 5991,
+  "queries": 50,
+  "chunks": 5991,
+  "index_build_s": 187.62,
+  "ms_per_query": 10.75,
+  "map_at_1000": 0.3459,
+  "n_queries": 50.0
+}

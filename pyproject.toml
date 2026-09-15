@@ -27,6 +27,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Alternative dense backend: USE-multilingual v3 in pure numpy (512-d).
+use = ["fast-universal-sentence-encoder>=0.2"]
 # The benchmark harness is the only thing that needs the heavy stack.
 bench = ["datasets>=2.19", "pyarrow", "huggingface_hub>=0.23"]
 validate = ["pytrec_eval-terrier>=0.5.6"]

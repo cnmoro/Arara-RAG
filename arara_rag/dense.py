@@ -10,10 +10,17 @@ from __future__ import annotations
 import numpy as np
 
 DEFAULT_DENSE_MODEL = "cnmoro/static-nomic-384-pten-v2"
+DEFAULT_USE_MODEL = "google/universal-sentence-encoder-multilingual-v3"
 
 
-class DenseEncoder:
-    """Wraps a Model2Vec static embedding model (numpy only)."""
+class StaticDenseEncoder:
+    """Wraps a Model2Vec static embedding model (numpy only).
+
+    A static model is a lookup table: encoding is tokenize-then-mean-pool, which
+    is why it is orders of magnitude faster than a real encoder.
+    """
+
+    backend = "static"
 
     def __init__(self, model_id: str = DEFAULT_DENSE_MODEL, cache_dir: str | None = None) -> None:
         from model2vec import StaticModel  # imported lazily to keep module import cheap
@@ -32,6 +39,58 @@ class DenseEncoder:
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         np.divide(vecs, np.maximum(norms, 1e-12), out=vecs)
         return vecs
+
+
+class USEDenseEncoder:
+    """Google Universal Sentence Encoder multilingual v3, pure numpy.
+
+    Uses the ``fast-universal-sentence-encoder`` port: a pure-Python
+    normalizer plus unigram Viterbi, and a numpy forward pass of the DAN +
+    CNN n-gram encoder. Still no PyTorch and no ONNX Runtime, but it computes
+    n-gram embeddings per text rather than doing a table lookup, so it is far
+    slower to index than a static model.
+    """
+
+    backend = "use"
+
+    def __init__(self, model_id: str = DEFAULT_USE_MODEL, cache_dir: str | None = None) -> None:
+        from usem3 import USE
+
+        self.model_id = model_id
+        self.model = USE()
+        self.dim = 512
+
+    def encode(self, texts, batch_size: int = 256, show_progress: bool = False) -> np.ndarray:
+        vecs = self.model.encode(list(texts))
+        vecs = np.asarray(vecs, dtype=np.float32)
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        np.divide(vecs, np.maximum(norms, 1e-12), out=vecs)
+        return vecs
+
+
+# Backwards-compatible alias: the static encoder was the original default.
+DenseEncoder = StaticDenseEncoder
+
+ENCODER_BACKENDS = {
+    "static": StaticDenseEncoder,
+    "use": USEDenseEncoder,
+}
+
+
+def build_encoder(backend: str = "static", model_id: str | None = None, cache_dir: str | None = None):
+    """Construct an encoder by backend name.
+
+    ``static`` -> Model2Vec static embeddings (default model: static-nomic-384-pten-v2)
+    ``use``    -> Universal Sentence Encoder multilingual v3 (512-d, numpy)
+    """
+    if backend not in ENCODER_BACKENDS:
+        raise ValueError(f"unknown dense backend: {backend!r}; expected one of {sorted(ENCODER_BACKENDS)}")
+    cls = ENCODER_BACKENDS[backend]
+    if model_id:
+        return cls(model_id, cache_dir=cache_dir)
+    return cls(cache_dir=cache_dir) if backend == "static" else cls()
 
 
 class DenseIndex:

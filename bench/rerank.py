@@ -10,6 +10,7 @@ every other row a pure reranking gain.
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -24,7 +25,7 @@ MODES = ["identity", "lexical", "dense", "hybrid", "cxm25"]
 TASKS = ["quati_reranking", "juristcu_reranking"]
 
 
-def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dict]:
+def run_task(task_key: str, modes: list[str], chunk: str = "window", encoder: str = "static") -> list[dict]:
     print(f"  loading {task_key} ...", flush=True)
     task = RERANK_LOADERS[task_key]()
     print(
@@ -35,7 +36,7 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
     )
 
     t0 = time.perf_counter()
-    arara = Arara(chunk_mode=chunk)
+    arara = Arara(chunk_mode=chunk, dense_backend=encoder)
     arara.add_documents({d: v["text"] for d, v in task.corpus.items()})
     arara.finalize(build_cxm25="cxm25" in modes, n_jobs=8)
     build_s = time.perf_counter() - t0
@@ -57,6 +58,7 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
             "experiment": f"{task_key}_{mode}",
             "task": task_key,
             "task_name": task.name,
+            "dense_backend": encoder,
             "mode": mode,
             "chunk": chunk,
             "corpus_docs": len(task.corpus),
@@ -76,15 +78,21 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
 
 
 def main() -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--encoder", default="static", choices=["static", "use"])
+    ap.add_argument("--out", default=None, help="defaults to bench/results/<encoder>")
+    args = ap.parse_args()
+
+    out_dir = Path(args.out) if args.out else RESULTS_DIR / args.encoder
+    out_dir.mkdir(parents=True, exist_ok=True)
     all_records = []
     for task_key in TASKS:
         print(f"[{task_key}]", flush=True)
-        recs = run_task(task_key, MODES)
+        recs = run_task(task_key, MODES, encoder=args.encoder)
         all_records.extend(recs)
         for rec in recs:
-            (RESULTS_DIR / f"{rec['experiment']}.json").write_text(json.dumps(rec, indent=2))
-    out = RESULTS_DIR / "summary_rerank.json"
+            (out_dir / f"{rec['experiment']}.json").write_text(json.dumps(rec, indent=2))
+    out = out_dir / "summary_rerank.json"
     out.write_text(json.dumps(all_records, indent=2))
     print(f"\nwrote {out}")
 

@@ -9,7 +9,7 @@ from typing import Literal
 import numpy as np
 
 from .chunk import Chunker, canonicalize
-from .dense import DEFAULT_DENSE_MODEL, DenseEncoder, DenseIndex
+from .dense import DEFAULT_DENSE_MODEL, DenseEncoder, DenseIndex, build_encoder
 from .fuse import rank_from_scores, reciprocal_rank_fusion
 from .lexical import BM25Index, CXM25Scorer
 from .text import Tokenizer
@@ -60,6 +60,7 @@ class Arara:
     def __init__(
         self,
         dense_model: str = DEFAULT_DENSE_MODEL,
+        dense_backend: str = "static",
         chunk_mode: str = "tinyzchunk",
         max_chunk_chars: int = 2500,
         min_chunk_chars: int = 100,
@@ -71,6 +72,7 @@ class Arara:
         encoder: DenseEncoder | None = None,
     ) -> None:
         self.dense_model = dense_model
+        self.dense_backend = dense_backend
         self.candidate_k = candidate_k
         self.rrf_k = rrf_k
         # (dense, lexical) weights for reciprocal rank fusion.
@@ -99,7 +101,10 @@ class Arara:
     @property
     def encoder(self) -> DenseEncoder:
         if self._encoder is None:
-            self._encoder = DenseEncoder(self.dense_model, cache_dir=self._cache_dir)
+            model_id = self.dense_model if self.dense_backend == "static" else None
+            self._encoder = build_encoder(
+                self.dense_backend, model_id, cache_dir=self._cache_dir
+            )
         return self._encoder
 
     def __len__(self) -> int:
@@ -365,8 +370,11 @@ class Arara:
         return {
             "documents": len(self._doc_ids),
             "chunks": len(self._chunks),
-            "dense_backend": "model2vec/numpy",
-            "dense_model": self.dense_model,
+            "dense_backend": self.dense_backend,
+            "dense_model": (
+                self.dense_model if self.dense_backend == "static"
+                else getattr(self._encoder, "model_id", self.dense_backend)
+            ),
             "dense_bytes": dense_bytes,
             "lexical_bytes": self._lex.nbytes,
             "lexical_backend": self._lex.__class__.__name__,
