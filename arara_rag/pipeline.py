@@ -61,22 +61,39 @@ def _limit_threads():
     return threadpool_limits(limits=1)
 
 
-def _worker_prepare(item):
-    """Chunk and embed one document. Must stay module level and picklable."""
-    doc_id, canonical = item
+def _worker_prepare(batch):
+    """Chunk and embed a batch of documents. Module level, so it can be mapped.
+
+    A batch rather than a single document, because encoders with a per-call cost
+    (nanoE5 dequantises its 4-bit weights every call) are far more efficient on
+    a large batch: 286 ms per passage at batch 1 against 99 ms at 256.
+    """
+    import numpy as _np
+
     chunker = _WORKER_STATE["chunker"]
     encoder = _WORKER_STATE["encoder"]
+    per_doc = []
     limit = _limit_threads()
+
+    def run():
+        chunks_per_doc = [chunker.split(doc_id, canonical) for doc_id, canonical in batch]
+        texts = [c.text for chunks in chunks_per_doc for c in chunks]
+        if not texts:
+            return [(chunks, _empty(encoder.dim)) for chunks in chunks_per_doc]
+        size = max(1, int(getattr(encoder, "batch_size", 256)))
+        parts = [encoder.encode(texts[i : i + size]) for i in range(0, len(texts), size)]
+        vectors = _np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+        out, pos = [], 0
+        for chunks in chunks_per_doc:
+            n = len(chunks)
+            out.append((chunks, vectors[pos : pos + n] if n else _empty(encoder.dim)))
+            pos += n
+        return out
+
     if limit is None:
-        chunks = chunker.split(doc_id, canonical)
-        texts = [c.text for c in chunks]
-        vectors = encoder.encode(texts) if texts else _empty(encoder.dim)
-        return chunks, vectors
+        return run()
     with limit:
-        chunks = chunker.split(doc_id, canonical)
-        texts = [c.text for c in chunks]
-        vectors = encoder.encode(texts) if texts else _empty(encoder.dim)
-    return chunks, vectors
+        return run()
 
 
 def _worker_tokenize(batch):
@@ -364,16 +381,18 @@ class Arara:
         _WORKER_STATE["chunker"] = self.chunker
         _WORKER_STATE["encoder"] = self.encoder
         self.timings["workers"] = float(workers)
+        # Documents are grouped so the encoder sees a full batch. One document is
+        # usually one chunk, which is the worst possible batch for nanoE5.
+        group = max(1, int(getattr(self.encoder, "batch_size", 256)))
+        batches = [jobs[i : i + group] for i in range(0, len(jobs), group)]
         if workers <= 1:
-            return [_worker_prepare(job) for job in jobs]
-        chunksize = max(1, len(jobs) // (workers * 8))
-        ctx = mp.get_context("fork")
+            return [r for batch in batches for r in _worker_prepare(batch)]
         try:
-            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-                return list(pool.map(_worker_prepare, jobs, chunksize=chunksize))
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as pool:
+                return [r for part in pool.map(_worker_prepare, batches) for r in part]
         except (OSError, RuntimeError):  # pragma: no cover - sandboxed hosts
             # A pool that cannot start must not fail the ingest.
-            return [_worker_prepare(job) for job in jobs]
+            return [r for batch in batches for r in _worker_prepare(batch)]
 
     def _place_slots(self, chunks, doc_idx, slots: np.ndarray) -> None:
         need = int(slots.max(initial=-1)) + 1

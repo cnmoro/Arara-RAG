@@ -75,6 +75,30 @@ def readme_tables(base: Path | None = None) -> str:
            "single-chunk documents, so this isolates dense vs lexical vs fusion)\n"]
     out += lines
 
+    nano_base = (base or RESULTS_DIR) / "nanoe5"
+    nano_core = load("core", nano_base)
+    if nano_core:
+        nano_by_task = {}
+        for r in nano_core:
+            nano_by_task.setdefault(r["task"], {})[r["mode"]] = r
+        out.append("\n**Backend comparison, nDCG@10** — same corpus, same chunking\n")
+        out.append("| Task | static dense | nanoE5 dense | static hybrid | nanoE5 hybrid | lexical |")
+        out.append("|---|---|---|---|---|---|")
+        for t in order:
+            modes = by_task.get(t)
+            nm = nano_by_task.get(t)
+            if not modes or not nm:
+                continue
+            f = lambda v: f"{v:.4f}" if v is not None else "-"  # noqa: E731
+            out.append(
+                f"| {names[t]} | {f(modes.get('dense', {}).get('ndcg_at_10'))} | "
+                f"{f(nm.get('dense', {}).get('ndcg_at_10'))} | "
+                f"{f(modes.get('hybrid', {}).get('ndcg_at_10'))} | "
+                f"{f(nm.get('hybrid', {}).get('ndcg_at_10'))} | "
+                f"{f(modes.get('lexical', {}).get('ndcg_at_10'))} |"
+            )
+        out.append("")
+
     ab = load("brtaxqa", base)
     if ab:
         out.append("\n**BRTaxQAR ablation, nDCG@10** — each row changes one thing\n")

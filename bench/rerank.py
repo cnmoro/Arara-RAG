@@ -25,7 +25,8 @@ MODES = ["identity", "lexical", "dense", "hybrid", "cxm25"]
 TASKS = ["quati_reranking", "juristcu_reranking"]
 
 
-def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dict]:
+def run_task(task_key: str, modes: list[str], chunk: str = "window",
+             encoder: str = "static") -> list[dict]:
     print(f"  loading {task_key} ...", flush=True)
     task = RERANK_LOADERS[task_key]()
     print(
@@ -36,7 +37,7 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
     )
 
     t0 = time.perf_counter()
-    arara = Arara(chunk_mode=chunk)
+    arara = Arara(chunk_mode=chunk, dense_backend=encoder)
     arara.add_documents({d: v["text"] for d, v in task.corpus.items()})
     arara.finalize(build_cxm25="cxm25" in modes, n_jobs=8)
     build_s = time.perf_counter() - t0
@@ -60,6 +61,7 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
             "task_name": task.name,
             "mode": mode,
             "chunk": chunk,
+            "dense_backend": encoder,
             "corpus_docs": len(task.corpus),
             "queries": len(task.queries),
             "chunks": arara.n_chunks,
@@ -78,15 +80,16 @@ def run_task(task_key: str, modes: list[str], chunk: str = "window") -> list[dic
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(RESULTS_DIR))
+    ap.add_argument("--encoder", default="static", choices=["static", "nanoe5"])
+    ap.add_argument("--out", default=None, help="defaults to bench/results/<encoder>")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.out) if args.out else RESULTS_DIR / args.encoder
     out_dir.mkdir(parents=True, exist_ok=True)
     all_records = []
     for task_key in TASKS:
         print(f"[{task_key}]", flush=True)
-        recs = run_task(task_key, MODES)
+        recs = run_task(task_key, MODES, encoder=args.encoder)
         all_records.extend(recs)
         for rec in recs:
             (out_dir / f"{rec['experiment']}.json").write_text(json.dumps(rec, indent=2))

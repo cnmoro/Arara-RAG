@@ -790,91 +790,38 @@
   },
   "arara": {
     "BRTaxQAR": {
-      "static|brtaxqa_capped_dense": 0.2934,
-      "static|brtaxqa_capped_document_dense": 0.1496,
-      "static|brtaxqa_capped_hybrid": 0.3486,
-      "static|brtaxqa_capped_lexical": 0.4051,
-      "static|brtaxqa_capped_tinyzchunk_dense": 0.3088,
-      "static|brtaxqa_capped_tinyzchunk_hybrid": 0.3425,
-      "static|brtaxqa_capped_window_dense": 0.2934,
-      "static|sweep_brtaxqa_capped_w1x1": 0.3486,
-      "static|sweep_brtaxqa_capped_w1x2": 0.3679,
-      "static|sweep_brtaxqa_capped_w1x3": 0.3745,
-      "static|sweep_brtaxqa_capped_w1x5": 0.3871,
-      "nanoe5|brtaxqa_capped_dense": 0.3423,
-      "nanoe5|brtaxqa_capped_hybrid": 0.418,
-      "nanoe5|brtaxqa_capped_lexical": 0.4051
+      "brtaxqa_capped_dense": 0.3423,
+      "brtaxqa_capped_hybrid": 0.418,
+      "brtaxqa_capped_lexical": 0.4051
     },
     "FaqBacenRetrieval": {
-      "static|cxm25_faq_bacen_hybrid": 0.4526,
-      "static|cxm25_faq_bacen_hybrid_cxm25": 0.4707,
-      "static|faq_bacen_dense": 0.3744,
-      "static|faq_bacen_hybrid": 0.4526,
-      "static|faq_bacen_lexical": 0.4881,
-      "static|sweep_faq_bacen_w1x1": 0.4526,
-      "static|sweep_faq_bacen_w1x2": 0.4765,
-      "static|sweep_faq_bacen_w1x3": 0.4798,
-      "static|sweep_faq_bacen_w1x5": 0.4845,
-      "nanoe5|faq_bacen_dense": 0.5858,
-      "nanoe5|faq_bacen_hybrid": 0.5659,
-      "nanoe5|faq_bacen_lexical": 0.4881
+      "faq_bacen_dense": 0.5858,
+      "faq_bacen_hybrid": 0.5659,
+      "faq_bacen_lexical": 0.4881
     },
     "FaQuADIR": {
-      "static|cxm25_faquadir_hybrid": 0.8304,
-      "static|cxm25_faquadir_hybrid_cxm25": 0.9078,
-      "static|faquadir_dense": 0.7139,
-      "static|faquadir_hybrid": 0.8304,
-      "static|faquadir_lexical": 0.8961,
-      "static|sweep_faquadir_w1x1": 0.8304,
-      "static|sweep_faquadir_w1x2": 0.8635,
-      "static|sweep_faquadir_w1x3": 0.8762,
-      "static|sweep_faquadir_w1x5": 0.8826,
-      "nanoe5|faquadir_dense": 0.8314,
-      "nanoe5|faquadir_hybrid": 0.8906,
-      "nanoe5|faquadir_lexical": 0.8961
-    },
-    "Quati": {
-      "static|cxm25_quati_hybrid": 0.4046,
-      "static|cxm25_quati_hybrid_cxm25": 0.4211,
-      "static|quati_dense": 0.3268,
-      "static|quati_hybrid": 0.4046,
-      "static|quati_lexical": 0.4067
+      "faquadir_dense": 0.8314,
+      "faquadir_hybrid": 0.8906,
+      "faquadir_lexical": 0.8961
     },
     "JurisTCU": {
-      "static|juristcu_dense": 0.3887,
-      "static|juristcu_hybrid": 0.489,
-      "static|juristcu_lexical": 0.5378,
-      "static|sweep_juristcu_w1x1": 0.489,
-      "static|sweep_juristcu_w1x2": 0.5071,
-      "static|sweep_juristcu_w1x3": 0.5216,
-      "static|sweep_juristcu_w1x5": 0.5296,
-      "nanoe5|juristcu_dense": 0.4906,
-      "nanoe5|juristcu_hybrid": 0.5685,
-      "nanoe5|juristcu_lexical": 0.5378
+      "juristcu_dense": 0.4906,
+      "juristcu_hybrid": 0.5685,
+      "juristcu_lexical": 0.5378
     },
     "JurisTCUReranking": {
-      "static|juristcu_reranking_cxm25": 0.4845,
-      "static|juristcu_reranking_dense": 0.3609,
-      "static|juristcu_reranking_hybrid": 0.4129,
-      "static|juristcu_reranking_identity": 0.415,
-      "static|juristcu_reranking_lexical": 0.4279,
-      "nanoe5|juristcu_reranking_cxm25": 0.4845,
-      "nanoe5|juristcu_reranking_dense": 0.4616,
-      "nanoe5|juristcu_reranking_hybrid": 0.4698,
-      "nanoe5|juristcu_reranking_identity": 0.415,
-      "nanoe5|juristcu_reranking_lexical": 0.4279
+      "juristcu_reranking_cxm25": 0.4845,
+      "juristcu_reranking_dense": 0.4616,
+      "juristcu_reranking_hybrid": 0.4698,
+      "juristcu_reranking_identity": 0.415,
+      "juristcu_reranking_lexical": 0.4279
     },
     "QuatiReranking": {
-      "static|quati_reranking_cxm25": 0.31,
-      "static|quati_reranking_dense": 0.2798,
-      "static|quati_reranking_hybrid": 0.3066,
-      "static|quati_reranking_identity": 0.2839,
-      "static|quati_reranking_lexical": 0.2939,
-      "nanoe5|quati_reranking_cxm25": 0.31,
-      "nanoe5|quati_reranking_dense": 0.5003,
-      "nanoe5|quati_reranking_hybrid": 0.43,
-      "nanoe5|quati_reranking_identity": 0.2839,
-      "nanoe5|quati_reranking_lexical": 0.2939
+      "quati_reranking_cxm25": 0.31,
+      "quati_reranking_dense": 0.5003,
+      "quati_reranking_hybrid": 0.43,
+      "quati_reranking_identity": 0.2839,
+      "quati_reranking_lexical": 0.2939
     }
   }
 }

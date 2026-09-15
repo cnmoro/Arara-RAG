@@ -25,6 +25,7 @@ class DenseEncoder:
     """
 
     backend = "static"
+    batch_size = 512
 
     def __init__(self, model_id: str = DEFAULT_DENSE_MODEL, cache_dir: str | None = None) -> None:
         from model2vec import StaticModel  # imported lazily to keep module import cheap
@@ -60,6 +61,10 @@ class NanoE5Encoder:
     """
 
     backend = "nanoe5"
+    # One call encodes at most this many passages. nanoE5 dequantises its 4-bit
+    # weights per call, so a batch of one costs 286 ms per passage against 99 ms
+    # at 256 -- batching is most of its throughput.
+    batch_size = 64
 
     def __init__(
         self,
@@ -82,8 +87,11 @@ class NanoE5Encoder:
         self.model = E5(variant=variant, num_threads=num_threads)
         self.dim = int(self.model.dim)
 
-    def encode(self, texts, batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
-        return _l2(np.atleast_2d(np.asarray(self.model.passage(list(texts)), dtype=np.float32)))
+    def encode(self, texts, batch_size: int | None = None, show_progress: bool = False) -> np.ndarray:
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, self.dim), dtype=np.float32)
+        return _l2(np.atleast_2d(np.asarray(self.model.passage(texts), dtype=np.float32)))
 
     def encode_query(self, texts, **kwargs) -> np.ndarray:
         return _l2(np.atleast_2d(np.asarray(self.model.query(list(texts)), dtype=np.float32)))

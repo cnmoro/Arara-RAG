@@ -106,6 +106,21 @@ def arara_scores(base: Path | None = None) -> dict[str, dict[str, float]]:
     return out
 
 
+BACKENDS = ["static", "nanoe5"]
+
+
+def scores_by_backend(base=None):
+    """``{backend: {task: {experiment: score}}}`` for every backend present."""
+    root = base or RESULTS_DIR
+    out = {}
+    for name in BACKENDS:
+        d = root if name == "static" else root / name
+        got = arara_scores(d)
+        if got:
+            out[name] = got
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=None, help="results dir (default bench/results)")
@@ -113,7 +128,12 @@ def main() -> None:
     base = Path(args.dir) if args.dir else None
 
     lb = fetch_leaderboard()
-    ours = arara_scores(base)
+    by_backend = scores_by_backend(base)
+    # Prefix each experiment with its backend so the winner can be attributed.
+    ours = {}
+    for backend, per_backend in by_backend.items():
+        for task, exps in per_backend.items():
+            ours.setdefault(task, {}).update({f"{backend}|{e}": v for e, v in exps.items()})
 
     print("# MTEB-BR comparison\n")
     print("## Retrieval (nDCG@10)\n")
@@ -130,7 +150,8 @@ def main() -> None:
             continue
         best_exp = max(mine, key=lambda k: mine[k])
         best_val = mine[best_exp]
-        mode = best_exp.split("_")[-1]
+        backend, _, exp_name = best_exp.partition("|")
+        mode = f"{backend} {exp_name.split('_')[-1]}"
         if models:
             best_model = max(models, key=lambda k: models[k])
             best_lb = models[best_model]
@@ -154,7 +175,8 @@ def main() -> None:
             continue
         best_exp = max(mine, key=lambda k: mine[k])
         best_val = mine[best_exp]
-        mode = best_exp.split("_")[-1]
+        backend, _, exp_name = best_exp.partition("|")
+        mode = f"{backend} {exp_name.split('_')[-1]}"
         vals = sorted(models.values())
         if vals:
             best_model = max(models, key=lambda k: models[k])
@@ -166,22 +188,23 @@ def main() -> None:
         else:
             print(f"| {task} | {best_val:.4f} | {mode} | - | - | 0 | - |")
 
-    print("\n## Where each arara mode lands\n")
-    print("| Task | dense (pct) | lexical (pct) | hybrid (pct) |")
-    print("|---|---|---|---|")
+    print("\n## Where each backend lands (percentile on the leaderboard)\n")
+    cols = [(b, m) for b in BACKENDS for m in ("dense", "hybrid", "lexical")]
+    print("| Task | " + " | ".join(f"{b} {m}" for b, m in cols) + " |")
+    print("|" + "---|" * (len(cols) + 1))
     for task in RETRIEVAL_ORDER:
         models = lb.get(task, {})
-        mine = ours.get(task, {})
-        if not mine or not models:
+        if not models:
             continue
         vals = sorted(models.values())
 
         def pct_of(v: float, _vals=vals) -> str:
             pct = 100.0 * sum(1 for s in _vals if s < v) / len(_vals)
-            return f"{v:.4f} ({pct:.0f}th pct)"
+            return f"{v:.4f} ({pct:.0f}%)"
 
         cells = []
-        for mode in ("dense", "lexical", "hybrid"):
+        for backend, mode in cols:
+            mine = by_backend.get(backend, {}).get(task, {})
             exp = next((e for e in mine if e.endswith(f"_{mode}")), None)
             cells.append(pct_of(mine[exp]) if exp else "-")
         print(f"| {task} | " + " | ".join(cells) + " |")
@@ -191,6 +214,15 @@ def main() -> None:
         cache_path = cache_root / "leaderboard_comparison.json"
         cache_path.write_text(json.dumps({"leaderboard": lb, "arara": ours}, indent=2))
         print(f"\nwrote {cache_path}")
+        # One file per backend, so a chart can plot them separately. `ours`
+        # above is backend-prefixed and cannot be split again.
+        for backend, per_backend in by_backend.items():
+            d = cache_root / backend
+            d.mkdir(exist_ok=True)
+            (d / "leaderboard_comparison.json").write_text(
+                json.dumps({"leaderboard": lb, "arara": per_backend}, indent=2)
+            )
+            print(f"wrote {d / 'leaderboard_comparison.json'}")
 
 
 if __name__ == "__main__":

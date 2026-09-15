@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arara-rag"
-version = "0.5.0"
+version = "0.5.1"
 description = "Portuguese-first, CPU-only retrieval: tinyzchunk chunking, static embeddings, BM25, rank fusion and CXM25 reranking. numpy only, out-of-core, with metadata filtering and CRUD."
 readme = "README.md"
 requires-python = ">=3.10"

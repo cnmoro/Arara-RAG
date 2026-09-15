@@ -183,6 +183,8 @@ def main() -> None:
         help="dense backend: 'static' (Model2Vec, default) or 'nanoe5' (4-bit e5-small)",
     )
     ap.add_argument("--out", default=None, help="defaults to bench/results/<encoder>")
+    ap.add_argument("--only", default=None, nargs="+",
+                    help="restrict to these task keys (e.g. --only quati)")
     ap.add_argument("--max-queries", type=int, default=None,
                     help="subsample queries (for smoke runs); reported in output")
     args = ap.parse_args()
@@ -190,10 +192,9 @@ def main() -> None:
     exps = SUITES[args.suite] if args.suite != "all" else [
         e for s in ("core", "brtaxqa", "cxm25", "sweep") for e in SUITES[s]
     ]
-    if args.max_queries is None:
-        exps = list({e.name: e for e in exps}.values())
-    else:
-        exps = list({e.name: e for e in exps}.values())
+    exps = list({e.name: e for e in exps}.values())
+    if args.only:
+        exps = [e for e in exps if e.task in set(args.only)]
 
     out_dir = Path(args.out) if args.out else RESULTS_DIR / args.encoder
     out_dir.mkdir(parents=True, exist_ok=True)

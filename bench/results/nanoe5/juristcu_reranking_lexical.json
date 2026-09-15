@@ -1,0 +1,15 @@
+{
+  "experiment": "juristcu_reranking_lexical",
+  "task": "juristcu_reranking",
+  "task_name": "JurisTCUReranking",
+  "mode": "lexical",
+  "chunk": "window",
+  "dense_backend": "nanoe5",
+  "corpus_docs": 7429,
+  "queries": 150,
+  "chunks": 7429,
+  "index_build_s": 106.64,
+  "ms_per_query": 0.36,
+  "map_at_1000": 0.4279,
+  "n_queries": 150.0
+}

@@ -1,0 +1,15 @@
+{
+  "experiment": "juristcu_reranking_hybrid",
+  "task": "juristcu_reranking",
+  "task_name": "JurisTCUReranking",
+  "mode": "hybrid",
+  "chunk": "window",
+  "dense_backend": "nanoe5",
+  "corpus_docs": 7429,
+  "queries": 150,
+  "chunks": 7429,
+  "index_build_s": 106.64,
+  "ms_per_query": 8.37,
+  "map_at_1000": 0.4698,
+  "n_queries": 150.0
+}

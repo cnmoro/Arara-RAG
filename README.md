@@ -66,13 +66,28 @@ nDCG@10, fixed-window chunking. Metrics are computed by `bench/metrics.py`,
 which `bench/validate_metrics.py` checks against `pytrec_eval` to **0.0e+00**,
 and against scikit-learn on binary relevance.
 
-| Task | docs | rel./query | MRR@10 | dense | lexical | hybrid |
-|---|---|---|---|---|---|---|
-| BRTaxQAR (capped) | 478 | 2.92 | 0.516 | 0.2934 | **0.4051** | 0.3486 |
-| FaQuADIR | 244 | 1.0 | 0.873 | 0.7139 | **0.8961** | 0.8304 |
-| FaqBacenRetrieval | 1,673 | 1.0 | 0.433 | 0.3744 | **0.4881** | 0.4526 |
-| JurisTCU | 16,045 | 15.0 | 0.821 | 0.3887 | **0.5378** | 0.4890 |
-| Quati | 50,000 | 38.66 | 0.676 | 0.3268 | **0.4067** | 0.4046 |
+Both dense backends are shown, because the choice matters more than any
+parameter in the stack. `static` is the default; `nanoE5` is opt-in (see below).
+
+| Task | docs | rel./query | static dense | nanoE5 dense | static hybrid | nanoE5 hybrid | lexical |
+|---|---|---|---|---|---|---|---|
+| BRTaxQAR (capped) | 478 | 2.92 | 0.2934 | 0.3423 | 0.3486 | **0.4180** | 0.4051 |
+| FaQuADIR | 244 | 1.0 | 0.7139 | 0.8314 | 0.8304 | 0.8906 | **0.8961** |
+| FaqBacenRetrieval | 1,673 | 1.0 | 0.3744 | 0.5858 | 0.4526 | 0.5659 | 0.4881 |
+| JurisTCU | 16,045 | 15.0 | 0.3887 | 0.4906 | 0.4890 | **0.5685** | 0.5378 |
+| Quati | 50,000 | 38.66 | 0.3268 | _not run_\* | 0.4046 | _not run_\* | 0.4067 |
+
+\* Quati's nanoE5 index did not finish in the time available — it is feasible
+(~15 minutes of encoding), but this host was carrying load from other tenants
+and three attempts stalled past 45 minutes. Everything else in this table was run
+twice with identical results.
+
+The last column is BM25 alone. Note what changes with a real encoder: **hybrid
+beats lexical on three of the four rows where both were measured**, and ties it
+on FaQuADIR. With the static model lexical won every row, so the argument for
+hybrid retrieval was not visible in these numbers until nanoE5 was added.
+
+![Dense and hybrid per backend against BM25](docs/encoders.png)
 
 **Read `rel./query` before comparing across rows.** nDCG@10 measures very
 different things on these tasks, and that is a property of the benchmarks rather
@@ -104,21 +119,9 @@ Arara(dense_backend="nanoe5")                              # or "static", the de
 Arara(dense_backend="nanoe5", dense_variant="original")    # English-first build
 ```
 
-It is meaningfully better, and it changes the shape of the results:
-
-| Task | static dense | nanoE5 dense | static hybrid | **nanoE5 hybrid** | lexical |
-|---|---|---|---|---|---|
-| BRTaxQAR (capped) | 0.2934 | 0.3423 | 0.3486 | **0.4180** | 0.4051 |
-| FaQuADIR | 0.7139 | 0.8314 | 0.8304 | 0.8906 | 0.8961 |
-| FaqBacenRetrieval | 0.3744 | 0.5858 | 0.4526 | **0.5659** | 0.4881 |
-| JurisTCU | 0.3887 | 0.4906 | 0.4890 | **0.5685** | 0.5378 |
-
-Two things follow. **Dense retrieval improves by 0.05–0.21 nDCG@10** — on
-FaqBacen that is a larger jump than the whole distance from BM25 to the
-leaderboard median. And **hybrid finally beats BM25**: with the static model,
-lexical alone won every task and the dense half was dead weight; with a real
-encoder, fusion wins three of four and ties FaQuADIR. That is the argument for
-hybrid retrieval, and it needed a dense model that carries its weight.
+It is meaningfully better: **dense retrieval improves by 0.05–0.21 nDCG@10** —
+on FaqBacen that is a larger jump than the whole distance from BM25 to the
+leaderboard median. The comparison table above is the full picture.
 
 The cost is indexing speed, and it tracks chunk length because nanoE5 windows
 anything past 512 tokens. On a fixed corpus of 300 passages of ~1.1 kB:
@@ -156,16 +159,44 @@ chunks, so it indexes the whole statute.
 
 ![Chunking a legal corpus beats truncating it by 3.4×](docs/ablation.png)
 
+This ablation is measured with the **static** backend. nanoE5 is not run here,
+and the reason is a property of that model rather than a gap in the table: it
+windows anything past 512 tokens, so BR-TaxQA's 2.5 kB chunks cost it about
+0.9 chunks/second. The capped corpus alone would take ~17 minutes and the
+full-document, tinyzchunk configuration — 60,927 such chunks — would take most
+of a day. The comparison that matters for nanoE5 is in
+[Retrieval quality](#retrieval-quality), where a real encoder changes the
+conclusion about hybrid retrieval.
+
 ## Against the leaderboard
 
-**On FaQuADIR, arara's best configuration outranks all 96 models on the board**
-— above `voyage-context-4`, `gemini-embedding-2` and `Qwen3-Embedding-8B` — on
-one CPU core. On BR-TaxQA-R it beats 90 of 95.
+Best configuration per backend, and how much of the field each beats:
+
+| Task | static best | nanoE5 best | best on the leaderboard | leaderboard median |
+|---|---|---|---|---|
+| FaQuADIR | **0.9078** (hybrid+CXM25) | 0.8906 (hybrid) | voyage-context-4 (0.8738) | 0.7689 |
+| BRTaxQAR | 0.4051 (lexical) | **0.4180** (hybrid) | voyage-finance-2 (0.4499) | 0.2723 |
+| JurisTCU | 0.5378 (lexical) | **0.5685** (hybrid) | llama-embed-nemotron-8b (0.6805) | 0.5436 |
+| FaqBacenRetrieval | 0.4881 (lexical) | **0.5858** (dense) | codestral-embed (0.8262) | 0.6516 |
+| Quati | 0.4211 (hybrid+CXM25) | _not run_ | voyage-context-4 (0.6901) | 0.5569 |
+
+| Task | static dense | static hybrid | static lexical | nanoE5 dense | nanoE5 hybrid |
+|---|---|---|---|---|---|
+| FaQuADIR | 31% | 80% | **100%** | 81% | **100%** |
+| BRTaxQAR | 56% | 76% | 95% | 71% | **97%** |
+| JurisTCU | 25% | 34% | 47% | 35% | **62%** |
+| FaqBacenRetrieval | 18% | 27% | 30% | **33%** | 30% |
+| Quati | 22% | 29% | 29% | - | - |
+
+Percentages are the share of the 95-96 published models each beats.
+**On FaQuADIR arara outranks every model on the board**, and on BRTaxQAR the
+nanoE5 hybrid beats 92 of 95. The static model's dense retrieval is the weak cell
+in every row — 18% on FaqBacen, 25% on JurisTCU — and nanoE5 lifts both.
 
 The honest caveat: the leaderboard evaluates *embedding* models, and there is no
-BM25 entry on it. arara's strongest modes are lexical, and lexical retrieval is
-simply very good on short, high-overlap PT-BR documents — part of that gap is a
-missing baseline on their side, not a transformer-killing dense model on ours.
+BM25 entry on it. arara's strongest static modes are lexical, and lexical
+retrieval is simply very good on short, high-overlap PT-BR documents — part of
+that gap is a missing baseline on their side.
 
 ![arara against the MTEB-BR leaderboard](docs/leaderboard.png)
 
@@ -174,10 +205,15 @@ missing baseline on their side, not a transformer-killing dense model on ours.
 MTEB-BR reranking hands you a fixed candidate list and scores only the order
 (MAP@1000), so `identity` is the baseline the benchmark ships with.
 
-| Task | identity | dense | lexical | hybrid | **CXM25** |
-|---|---|---|---|---|---|
-| QuatiReranking | 0.2839 | 0.2798 | 0.2939 | 0.3066 | **0.3100** |
-| JurisTCUReranking | 0.4150 | 0.3609 | 0.4279 | 0.4129 | **0.4845** |
+| Task | identity | static dense | nanoE5 dense | static hybrid | nanoE5 hybrid | CXM25 |
+|---|---|---|---|---|---|---|
+| QuatiReranking | 0.2839 | 0.2798 | **0.5003** | 0.3066 | 0.4300 | 0.3100 |
+| JurisTCUReranking | 0.4150 | 0.3609 | 0.4616 | 0.4129 | 0.4698 | **0.4845** |
+
+This is the sharpest version of the same story. On QuatiReranking the static
+dense model *regresses* on the candidate order it was given (0.2839 → 0.2798),
+while nanoE5 dense improves it by **+0.22 MAP@1000** and beats every static mode,
+CXM25 included. Lexical reranking is unaffected by the backend, as it must be.
 
 ## Out-of-core, metadata, CRUD
 

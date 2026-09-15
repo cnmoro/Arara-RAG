@@ -25,7 +25,7 @@ from .pipeline import Arara
 from .text import Tokenizer
 from .types import Chunk, Hit
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "Arara",
