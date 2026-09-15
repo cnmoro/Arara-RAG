@@ -120,10 +120,18 @@ lexical alone won every task and the dense half was dead weight; with a real
 encoder, fusion wins three of four and ties FaQuADIR. That is the argument for
 hybrid retrieval, and it needed a dense model that carries its weight.
 
-The cost is indexing — nanoE5 windows anything past 512 tokens, so the penalty
-tracks chunk length: ~4× for short chunks, ~30× for 16k of them, and far more
-for a corpus of 2.5 kB chunks. Query latency is ~8 ms against 0.5–7 ms, since a
-query is one short sequence either way.
+The cost is indexing speed, and it tracks chunk length because nanoE5 windows
+anything past 512 tokens. On a fixed corpus of 300 passages of ~1.1 kB:
+
+| | static | nanoE5 |
+|---|---|---|
+| index build | 2.5 s (121 docs/s) | 14.4 s (21 docs/s) |
+| query p50 | 0.5 ms | 13 ms |
+
+Longer chunks cost more than proportionally — a corpus of 2.5 kB chunks is far
+slower again — while queries are one short sequence either way. nanoE5's query
+latency also has a longer tail than the static model's, so prefer `static` where
+p99 matters more than recall.
 
 CXM25 reranking on top of the hybrid adds **+0.018 to +0.077 nDCG@10** across
 these tasks for 1–6 ms per query (FaQuADIR: 0.8304 → **0.9078**,
