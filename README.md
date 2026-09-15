@@ -1,383 +1,191 @@
 # arara-rag
 
-**A Portuguese-first retrieval stack that runs entirely on CPU.** Chunking,
-dense retrieval, lexical retrieval, rank fusion and reranking — numpy only, no
-PyTorch, no ONNX Runtime, no FAISS.
+**Portuguese-first retrieval that runs entirely on CPU.** Chunking, dense and
+lexical retrieval, rank fusion and reranking — numpy only. No PyTorch, no ONNX
+Runtime, no FAISS. The whole install is **200 MB**.
 
 ```bash
-# Not on PyPI yet -- install from the repository:
 git clone https://github.com/cnmoro/Arara-RAG.git && cd Arara-RAG
-pip install -e ".[bench]"
+pip install -e .
 ```
 
 ```python
 from arara_rag import Arara
 
-arara = Arara()                                  # PT-BR defaults
-arara.add_documents({"lei": open("lei.txt").read()})
-hits = arara.search("qual a alíquota do imposto de renda?", top_k=5)
-
-for h in hits[:3]:
-    print(h.score, h.doc_id, arara.resolve(h))   # exact source span
+arara = Arara(path="./indice")            # out-of-core and persistent
+arara.add_documents(
+    {"lei_1234": open("lei.txt").read()},
+    metadata={"ano": 2024, "tipo": "lei", "uf": "BR"},
+)
+hits = arara.search("qual a alíquota?", top_k=5, where={"ano": {"$gte": 2020}})
+print(hits[0].doc_id, arara.resolve(hits[0]))     # exact source span
 ```
 
-`arara.resolve(hit)` returns the exact substring the hit points at, because
-every chunk carries character offsets into the canonical source document — not
-just the chunk text.
+## What's in it
 
-The main knobs are the dense encoder and the fusion weights. Both choices are
-measured rather than assumed — see
-[the encoder ablation](#encoder-ablation-static-nomic-vs-universal-sentence-encoder)
-and [the fusion sweep](#a-negative-result-the-fusion-weights). The defaults are
-the static encoder and untuned 1:1 fusion.
+| Stage | Component | Size |
+|---|---|---|
+| Chunking | [`tinyzchunk`](https://github.com/cnmoro/tinyzchunk) — tokenizer-free, distilled from an LLM teacher | 2.1 MB |
+| Dense | [`static-nomic-384-pten-v2`](https://huggingface.co/cnmoro/static-nomic-384-pten-v2) — Model2Vec static embeddings | 62 MB |
+| Lexical | BM25 over a numpy inverted index | — |
+| Rerank | [`CXM25`](https://github.com/cnmoro/CXM25) — PT-BR lexical scoring | bundled |
+| Fusion | Reciprocal Rank Fusion | — |
 
-```python
-Arara(dense_backend="use")          # USE-multilingual v3, still numpy-only
-Arara(fusion_weights=(1.0, 3.0))    # bias rank fusion toward BM25
-```
+An index can be **out-of-core**: vectors live in a memory-mapped file and
+documents, metadata and offsets in SQLite, so the index is about **1 KB per
+document** and cold pages can be evicted by the OS instead of being pinned on
+the heap. Same API either way — `Arara()` keeps everything in memory.
 
-```bash
-python -m arara_rag search "licenciamento ambiental" docs/ --json -k 3
-```
+## Speed and memory
 
----
+One CPU core, no GPU. Measured end to end with `python -m bench.profile`.
 
-## Why this exists
-
-Brazilian Portuguese is mostly served by English-first tooling and GPU-scale
-models. arara is the opposite bet: **retrieval quality per CPU-cycle**. Every
-layer is a small model, most of them built specifically for PT-BR, and the whole
-thing installs in **200 MB**.
-
-| Stage | Component | Size | Origin |
-|---|---|---|---|
-| Chunking | [`tinyzchunk`](https://github.com/cnmoro/tinyzchunk) — tokenizer-free, distilled from an LLM teacher | 2.1 MB | cnmoro |
-| Dense | [`static-nomic-384-pten-v2`](https://huggingface.co/cnmoro/static-nomic-384-pten-v2) — Model2Vec static embeddings (or USE-multilingual v3, see the ablation below) | 62 MB | cnmoro / Google |
-| Lexical | BM25 over a numpy inverted index | — | this repo |
-| Rerank | [`CXM25`](https://github.com/cnmoro/CXM25) — BM25-inspired lexical scoring with a PT-BR stemmer | bundled | cnmoro |
-| Fusion | Reciprocal Rank Fusion | — | this repo |
-
-Also included, both written here against the same index: an exact numpy vector
-index and a BM25 inverted index, plus a `rerank()` / `score_documents()` API for
-scoring a fixed candidate set.
-
-Nothing here needs a GPU, a tokenizer model server, or a transformer runtime.
-A static embedding model is a lookup table, so encoding is tokenize-then-lookup
-and search is one matrix multiply.
-
-### Runtime footprint, measured
-
-| | Size |
-|---|---|
-| arara-rag, clean venv, 26 packages | **200 MB** |
-| PyTorch alone | 1.6 GB |
-| `torch` + `transformers` + `faiss` (typical RAG stack) | ~4 GB |
-
-The optional USE encoder (`pip install "arara-rag[use]"`) adds 32 MB.
-
----
-
-## Results
-
-All numbers are on **MTEB-BR** (the Brazilian Portuguese embedding benchmark,
-[public leaderboard](https://huggingface.co/spaces/MTEB-BR/leaderboard) with 98
-evaluated models). Metrics are computed by `bench/metrics.py`, and
-`bench/validate_metrics.py` asserts they match `pytrec_eval` to 0.0e+00 — the
-same library MTEB uses, including its less obvious choice of **linear** NDCG
-gain.
-
-<!-- RESULTS_START -->
-### Cross-task, nDCG@10
-
-Fixed-window chunking. These corpora are mostly single-chunk documents, so this
-table isolates the retrievers rather than the chunker.
-
-| Task | docs | dense | lexical | hybrid | best |
+| documents | index build | query p50 | query p95 | index size | peak RSS to serve |
 |---|---|---|---|---|---|
-| BRTaxQAR (capped) | 478 | 0.2933 | 0.4051 | 0.3487 | **lexical** |
-| FaQuADIR | 244 | 0.7135 | 0.8961 | 0.8304 | **lexical** |
-| FaqBacenRetrieval | 1,673 | 0.3745 | 0.4881 | 0.4526 | **lexical** |
-| JurisTCU | 16,045 | 0.3887 | 0.5378 | 0.4878 | **lexical** |
-| Quati | 50,000 | 0.3268 | 0.4067 | 0.4046 | **lexical** |
+| 1,000 | 6.7 s | **0.44 ms** | 0.48 ms | 1.8 MB | 473 MB |
+| 10,000 | 70 s | **0.86 ms** | 4.2 ms | 18 MB | 482 MB |
+| 50,000 | 382 s | **7.1 ms** | 8.3 ms | 91 MB | 555 MB |
 
-Query latency: 0.3–6.7 ms per query on one CPU core, whole corpus scored per
-query. Index build: 1.7 s for 244 documents, 139 s for 50,000.
+- **~130–150 documents/second** to chunk, embed, tokenise and index.
+- **~1.8 KB per document** of index: 1.5 KB of vectors plus BM25 postings.
+- Query latency scales with corpus size because both retrievers score the whole
+  corpus per query — that is what makes the ranking exact rather than
+  approximate.
+- Peak RSS is dominated by a **~470 MB fixed cost** (Python, numpy, the
+  embedding model and the tokenizer tables); the corpus adds ~1.7 KB per
+  document on top. Vectors are memory-mapped, so cold pages can be evicted.
 
-### BRTaxQAR ablation, nDCG@10
+![Speed and memory](docs/scaling.png)
 
-Each row changes exactly one thing. "One vector per document" is the operating
-point every fixed-window embedder is stuck at.
+## Retrieval quality
+
+MTEB-BR, the Brazilian Portuguese benchmark with a
+[public leaderboard](https://huggingface.co/spaces/MTEB-BR/leaderboard).
+nDCG@10, fixed-window chunking. Metrics are computed by `bench/metrics.py`,
+which `bench/validate_metrics.py` checks against `pytrec_eval` to **0.0e+00**.
+
+| Task | docs | dense | lexical | hybrid |
+|---|---|---|---|---|
+| BRTaxQAR (capped) | 478 | 0.2934 | **0.4051** | 0.3486 |
+| FaQuADIR | 244 | 0.7139 | **0.8961** | 0.8304 |
+| FaqBacenRetrieval | 1,673 | 0.3745 | **0.4881** | 0.4526 |
+| JurisTCU | 16,045 | 0.3887 | **0.5378** | 0.4890 |
+| Quati | 50,000 | 0.3268 | **0.4067** | 0.4046 |
+
+CXM25 reranking on top of the hybrid adds **+0.018 to +0.077 nDCG@10** across
+these tasks for 1–6 ms per query (FaQuADIR: 0.8304 → **0.9078**,
+BRTaxQAR full documents: 0.4801 → **0.5091**).
+
+## Why chunking matters most
+
+Legal documents in BR-TaxQA-R average 32,000 characters and reach 1.17M. MTEB-BR
+truncates them at 32k because transformer encoders cannot fit more. arara
+chunks, so it indexes the whole statute.
 
 | Configuration | chunks | nDCG@10 | R@100 |
 |---|---|---|---|
 | capped at 32k, one vector per doc *(the leaderboard's setting)* | 478 | 0.1496 | 0.4351 |
-| capped at 32k, fixed 2500-char windows | 2,552 | 0.2933 | 0.6300 |
-| capped at 32k, **tinyzchunk** boundaries | 23,319 | 0.3088 | 0.6225 |
-| capped at 32k, tinyzchunk + BM25 | 23,319 | 0.3420 | 0.7446 |
-| **full documents**, one vector per doc | 478 | 0.1496 | 0.4351 |
-| **full documents**, fixed windows | 6,439 | 0.4040 | 0.7497 |
-| **full documents**, paragraph splits | 6,439 | 0.4040 | 0.7497 |
+| capped at 32k, fixed windows | 2,552 | 0.2934 | 0.6300 |
+| capped at 32k, **tinyzchunk** | 23,319 | 0.3088 | 0.6225 |
+| **full documents**, fixed windows | 6,439 | 0.4041 | 0.7497 |
+| **full documents**, paragraph splits | 6,439 | 0.4041 | 0.7497 |
 | **full documents**, tinyzchunk | 60,927 | 0.4287 | 0.7486 |
-| **full documents**, tinyzchunk + BM25 | 60,927 | 0.4824 | 0.8496 |
+| **full documents**, tinyzchunk + BM25 | 60,927 | 0.4801 | 0.8496 |
 | **full documents**, + CXM25 rerank | 60,927 | **0.5091** | 0.8102 |
 
-What this says:
+![Chunking a legal corpus beats truncating it by 3.4×](docs/ablation.png)
 
-- **One vector per document scores 0.1496 — and the number is identical for
-  capped and full input.** Averaging a 300 KB statute into 384 dimensions
-  destroys it either way, so truncation is not the only problem. This is the
-  worst of the ten configurations, and it is the one the leaderboard is forced
-  into.
-- **Chunking roughly doubles it**: 0.1496 → 0.2933 (fixed windows) or 0.3088
-  (tinyzchunk).
-- **Refusing to truncate then adds more**: with the *same* fixed windows,
-  0.2933 → 0.4040. The learned chunker adds a further +0.025 on top.
-- **The full stack is 3.4× the leaderboard's operating point** on this task.
-- **Paragraph splitting ties fixed windows exactly** (0.4040, same chunk count).
-  On statutes, paragraphs are far longer than the window, so a "semantic" split
-  degenerates into the baseline it was meant to beat. This is the case for a
-  learned chunker rather than a formatting heuristic.
+## Against the leaderboard
 
-### CXM25 reranking earns its place
+**On FaQuADIR, arara's best configuration outranks all 96 models on the board**
+— above `voyage-context-4`, `gemini-embedding-2` and `Qwen3-Embedding-8B` — on
+one CPU core. On BR-TaxQA-R it beats 90 of 95.
 
-| Task | hybrid | + CXM25 rerank | Δ |
-|---|---|---|---|
-| FaQuADIR | 0.8304 | **0.9078** | +0.077 |
-| BRTaxQAR (full docs) | 0.4824 | **0.5091** | +0.027 |
-| FaqBacenRetrieval | 0.4526 | **0.4707** | +0.018 |
-| Quati | 0.4046 | **0.4211** | +0.017 |
+The honest caveat: the leaderboard evaluates *embedding* models, and there is no
+BM25 entry on it. arara's strongest modes are lexical, and lexical retrieval is
+simply very good on short, high-overlap PT-BR documents — part of that gap is a
+missing baseline on their side, not a transformer-killing dense model on ours.
 
-CXM25 improves every task it was tried on, for 1–6 ms per query.
+![arara against the MTEB-BR leaderboard](docs/leaderboard.png)
 
-### Reranking tasks: MAP@1000
+## Reranking
 
-MTEB-BR's reranking tasks hand you a fixed candidate list per query (BM25 hard
-negatives) and score only the resulting order, so `identity` is the baseline the
-benchmark ships with:
+MTEB-BR reranking hands you a fixed candidate list and scores only the order
+(MAP@1000), so `identity` is the baseline the benchmark ships with.
 
-| Task | identity (given order) | dense | lexical | hybrid | **CXM25** |
+| Task | identity | dense | lexical | hybrid | **CXM25** |
 |---|---|---|---|---|---|
 | QuatiReranking | 0.2839 | 0.2798 | 0.2939 | 0.3066 | **0.3100** |
 | JurisTCUReranking | 0.4150 | 0.3609 | 0.4279 | 0.4129 | **0.4845** |
 
-CXM25 is the best of arara's rerankers on both tasks, and the only one that beats
-the given order on both. Two things worth stating plainly:
+## Out-of-core, metadata, CRUD
 
-- **Dense reranking actively hurts** on JurisTCU (0.4150 → 0.3609). Reranking
-  discards the lexical safety net that RRF provides during retrieval, so a weak
-  semantic scorer does more damage here than in the retrieval tables above.
-- **Against purpose-built rerankers arara is not competitive.** The best
-  cross-encoder on the public board (`voyage/rerank-2.5`) scores 0.7560 and
-  0.6516 on these two tasks; CXM25 lands at the 11th and 38th percentile. A
-  lexical reranker is a cheap improvement over a BM25 order, not a replacement
-  for a cross-encoder.
+An index is read far more than it is written, so deletes are tombstones and
+freed slots are recycled on the next write.
 
-### A negative result: the fusion weights
+```python
+arara = Arara(path="./indice", max_chunk_chars=2000)
 
-Equal-weight RRF loses to lexical-only everywhere, so the weights were swept
-(dense : lexical, fixed at 1 : w):
+arara.add_documents(docs, metadata={"ano": 2024})        # insert / replace
+arara.update_metadata("lei_1234", {"revisado": True})    # no re-embedding
+arara.delete_document("lei_1234")                        # tombstone + slot reuse
+arara.get_document("lei_1234")                           # (text, metadata)
+arara.compact()                                          # reclaim file space
 
-| Task | 1:1 | 1:2 | 1:3 | 1:5 | lexical only |
-|---|---|---|---|---|---|
-| FaQuADIR | 0.8304 | 0.8635 | 0.8762 | 0.8826 | **0.8961** |
-| FaqBacen | 0.4526 | 0.4765 | 0.4798 | 0.4845 | **0.4881** |
-| BRTaxQAR (capped) | 0.3487 | 0.3679 | 0.3744 | 0.3871 | **0.4051** |
-| JurisTCU | 0.4878 | 0.5069 | 0.5216 | 0.5296 | **0.5378** |
+arara.search(q, where={"tipo": {"$in": ["lei", "decreto"]}, "ano": {"$gte": 2020}})
+arara.search(q, where={"$or": [{"uf": "SP"}, {"uf": "RJ"}]})
+```
 
-The hybrid improves **monotonically as the dense weight goes to zero, and never
-overtakes lexical alone**. That is the signature of a retriever contributing
-noise rather than signal: on these five tasks the static dense model is not
-earning its place.
-
-Two honest caveats before you act on it. The sweep was run on the same tasks
-reported above, so the tuned numbers are optimistic and the untuned 1:1 column
-is the one to trust in the cross-task table. And these five benchmarks are
-short-document, high-lexical-overlap PT-BR tasks — exactly the regime where
-BM25 is strongest and a 384-dimension static model is weakest. Dense retrieval
-should still help on paraphrase-heavy or cross-lingual queries, which none of
-these tasks measure. The default is therefore left untuned at 1:1, and this is
-flagged as the first thing worth investigating on your own data.
-
-### Encoder ablation: static-nomic vs Universal Sentence Encoder
-
-`Arara(dense_backend="use")` swaps in Google's Universal Sentence Encoder
-multilingual v3 — a real encoder (512-d, DAN + CNN n-grams) available as a pure
-numpy port, so still no PyTorch and no ONNX Runtime. It is the obvious challenger
-to a 384-d static model. It loses:
-
-| Task | static dense | USE dense | Δ | static hybrid | USE hybrid | Δ |
-|---|---|---|---|---|---|---|
-| FaQuADIR | **0.7135** | 0.6654 | −0.048 | **0.8304** | 0.8183 | −0.012 |
-| JurisTCU | **0.3887** | 0.2751 | −0.114 | **0.4878** | 0.4508 | −0.037 |
-| BRTaxQAR (capped) | **0.2933** | 0.2515 | −0.042 | 0.3487 | **0.3519** | +0.003 |
-| FaqBacenRetrieval | **0.3745** | 0.3579 | −0.017 | 0.4526 | **0.4562** | +0.004 |
-| Quati | 0.3268 | **0.3802** | **+0.053** | 0.4046 | **0.4357** | **+0.031** |
-
-**Dense retrieval: USE wins 1 of 5 tasks, mean Δ = −0.033.** Hybrid is close to a
-wash (mean Δ = −0.002) — but USE costs far more to index:
-
-| Corpus | chunks | static build | USE build |
-|---|---|---|---|
-| FaQuADIR | 244 | 1.7 s | 3.1 s |
-| BRTaxQAR (capped) | 2,552 | 13.2 s | 119.8 s |
-| JurisTCU | 16,047 | 17.9 s | 72.2 s |
-| Quati | 50,000 | 139 s | 825 s |
-
-Measured encode throughput on ~600-character passages: **7,671 docs/s for the
-static model against 150 docs/s for USE — roughly 50×.** A static model is a
-table lookup; USE computes n-gram embeddings for every text.
-
-The default stays `static`. The split is not random, though, and it is the most
-interesting finding here: **USE wins exactly where the corpus is large and
-general-domain** (Quati, 50k web passages) and loses everywhere the corpus is
-small and domain-specific (tax law, case law, FAQ). It also wins both Quati
-reranking modes — on QuatiReranking, USE dense (0.3474) beats every static mode
-including CXM25 (0.3100).
-
-So `dense_backend="use"` is worth trying if your corpus looks like Quati. It is
-not worth it as a default, and not worth it for legal or FAQ retrieval.
-<!-- RESULTS_END -->
-
-### Where this stands against the leaderboard
-
-MTEB-BR publishes per-task results for 98 models, including commercial APIs.
-Placing arara's best configuration among them:
-
-| Task | arara | best on the leaderboard | leaderboard median | models beaten |
-|---|---|---|---|---|
-| **FaQuADIR** | **0.9078** | voyage-context-4 (0.8738) | 0.7689 | **96 / 96** |
-| BRTaxQAR (capped) | 0.4051 | voyage-finance-2 (0.4499) | 0.2723 | 90 / 95 |
-| JurisTCU | 0.5378 | llama-embed-nemotron-8b (0.6805) | 0.5436 | 45 / 96 |
-| FaqBacenRetrieval | 0.4881 | codestral-embed (0.8262) | 0.6516 | 29 / 96 |
-| Quati | 0.4211 | voyage-context-4 (0.6901) | 0.5569 | 28 / 96 |
-
-**On FaQuADIR, arara outranks every model on the board** — above `voyage-context-4`,
-`gemini-embedding-2`, `Qwen3-Embedding-8B` and every other entry — at 200 MB and
-5.3 ms per query on one CPU core.
-
-Now the caveat, which matters more than the headline: **the leaderboard contains
-embedding models only. There is no BM25 entry on it.** arara's strongest modes
-are lexical, and lexical retrieval is simply very good on short,
-high-lexical-overlap PT-BR tasks. Part of what looks like a win is a missing
-baseline on their side rather than a transformer-killing dense model on ours.
-arara's *dense* mode alone lands between the 19th and 56th percentile, and that
-is the honest measure of the static encoder.
-
-BRTaxQAR is the one row where the comparison is exact: the leaderboard truncates
-documents at 32k, `brtaxqa_capped` does the same, and arara's lexical mode
-(0.4051) beats both `bge-m3` (0.3772) and `multilingual-e5-large`. The
-stack's full-document configuration reaches **0.5091** on input the leaderboard
-cannot represent at all.
-
-### Three things to take away
-
-1. **Chunking and truncation matter more than the retriever on long documents.**
-   The ten-row BRTaxQAR ablation spans 0.1496 → 0.5091; switching dense for
-   lexical moves a single task by at most 0.11.
-2. **The learned chunker earns its keep where formatting heuristics fail.**
-   Paragraph splitting tied fixed windows exactly; tinyzchunk did not.
-3. **CXM25 is the component that pays for itself**, improving every retrieval
-   task and beating the given BM25 order on both reranking tasks.
-4. **The static dense model does not earn its place on these tasks**, and the
-   fusion sweep plus the dense-reranking regression are the evidence. A better
-   PT-BR dense model is the single highest-leverage change to this stack.
-
----
+Supported per field: `$eq` (bare value), `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
+`$in`, `$nin`, `$exists`, `$contains`, `$startswith`, `$endswith`; plus
+top-level `$and` / `$or`. Field names are validated and values are bound as SQL
+parameters, so a filter cannot inject SQL.
 
 ## Guarantees
 
-The chunker's contract is enforced by tests, not asserted in prose
-(`tests/`):
+Enforced by 88 tests, not asserted in prose:
 
-- every chunk is an **exact substring** of the canonical document;
-- chunks are ordered and non-overlapping;
-- the gap between consecutive chunks contains **only whitespace** — no
-  non-whitespace character is ever dropped or duplicated;
-- **no chunk exceeds `max_chunk_chars`**, including on a 24,000-character
-  single line;
-- CRLF and LF inputs chunk **identically**, and offsets still resolve.
-
-Three of those required fixing behaviour inherited from upstream:
-
-| Problem | Fix |
-|---|---|
-| The upstream chunker strips whitespace between structural units, so chunks are not byte-adjacent | Contract redefined as "gaps are whitespace-only" and tested |
-| It returns **oversized chunks** on degenerate input (a very long single line) | arara splits oversized pieces at word boundaries before returning |
-| It leaves CRLF in the returned text, so `text[start:end] == chunk` fails | Line endings are canonicalised; `Arara.document_text()` exposes what offsets index into |
-
-There is also a regression test for a real bug found while building this: the
-BM25 inverted index derived its offsets from raw term occurrences instead of
-per-document unique terms, which left **uninitialised memory** in the postings
-arrays and corrupted scores. `test_bm25_matches_naive_definition` now compares
-the vectorised path against a literal implementation of the BM25 formula.
-
----
+- every chunk is an **exact substring** of the canonical document, ordered and
+  non-overlapping, with only whitespace between chunks — nothing is dropped;
+- **no chunk exceeds `max_chunk_chars`**, including on a 24,000-character line;
+- CRLF and LF inputs chunk **identically** and offsets still resolve;
+- the in-memory and on-disk paths return **identical rankings**;
+- importing the package never imports `torch` or `onnxruntime`.
 
 ## Reproduce
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e ".[bench]"
-python -m pytest tests/                       # 72 tests
-python bench/validate_metrics.py              # needs pytrec_eval-terrier
-./bench/run_all.sh                            # all suites, encoder=static
-./bench/run_all.sh use                        # the same sweep with USE-multilingual
-python -m bench.report --readme               # the tables above
-python -m bench.leaderboard                   # comparison against MTEB-BR
-python -m bench.compare_encoders              # static vs use, side by side
+python -m venv .venv && .venv/bin/pip install -e ".[bench,validate,dev]"
+python -m pytest tests/                 # 88 tests
+python bench/validate_metrics.py        # metrics vs pytrec_eval
+./bench/run_all.sh                      # every suite -> bench/results/
+python -m bench.profile                 # speed and memory -> docs/scaling.png
+python -m bench.charts                  # regenerate the figures
+python -m bench.leaderboard             # compare against MTEB-BR
 ```
-
-`bench/validate_metrics.py` is the only script needing `pytrec_eval`; it is the
-check that makes the metric numbers trustworthy, and it is worth running before
-believing any score in this README.
-
-The benchmark harness is the only part that needs the heavy stack
-(`datasets`, `pyarrow`). The library itself never imports torch or onnxruntime —
-`test_importing_the_package_does_not_import_torch` runs in a subprocess and
-fails if either appears in `sys.modules`.
-
----
 
 ## Layout
 
 ```
 arara_rag/
-  chunk.py      chunking + the losslessness contract
-  dense.py      static encoder + exact numpy index
+  chunk.py      chunking and the losslessness contract
+  dense.py      static encoder
   lexical.py    BM25 inverted index + CXM25 reranker
-  fuse.py       reciprocal rank fusion
-  pipeline.py   Arara: add_documents / search / resolve
-  cli.py        python -m arara_rag search
-bench/
-  tasks.py      MTEB-BR task loaders (pinned revisions)
-  metrics.py    nDCG / recall / MRR / MAP matching pytrec_eval
-  run.py        retrieval experiment suites
-  rerank.py     reranking experiment suite (MAP@1000)
-  compare_encoders.py  static vs USE side by side
-  leaderboard.py  comparison against the public leaderboard
-  report.py     markdown tables
-  results/      raw JSON per encoder (static/, use/)
-tests/          contract and correctness tests
-space/          Gradio demo for the HuggingFace Space
+  store.py      memory-mapped vectors, SQLite catalog, filters
+  pipeline.py   Arara: add / search / rerank / CRUD
+bench/          task loaders, metrics, suites, profiling, charts
+tests/          88 contract and correctness tests
+space/          Gradio demo
 ```
-
----
 
 ## Limitations
 
-- **PT-BR and English only.** The tokenizer, stemmer and stopwords are
-  Portuguese; both dense models are multilingual with EN+PT coverage. Other
-  languages will degrade.
-- **The dense model is small.** It will lose to transformer encoders on
-  semantic and paraphrase-heavy queries. Lexical retrieval carries this stack.
-  The USE backend is not a fix for this: it loses to the static model on 4 of 5
-  tasks and costs ~50× more to encode.
-- **The index is in memory.** It is float16 and fast, but there is no
-  disk-backed serving path yet.
-- **CXM25 reranking is ~71 µs/document**, so it is applied to a candidate set
-  rather than the whole corpus.
-- **The BRTaxQAR `document` runs use one vector per document**, which averages
-  away most of a 300 KB statute. They are reported to isolate truncation, not as
-  a recommended configuration.
+- **PT-BR and English.** The tokenizer, stemmer and stopwords are Portuguese.
+- **The dense model is small** and static; lexical retrieval carries the stack
+  on short, high-overlap documents.
+- **Per-chunk bookkeeping stays resident** (16 bytes/chunk); vectors, text and
+  metadata do not.
+- **CXM25 reranking is ~71 µs/document**, so it runs over a candidate set.
 
 ## License
 

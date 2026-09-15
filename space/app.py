@@ -80,7 +80,7 @@ def run(query: str, blob: str, mode: str = "hybrid", top_k: int = 3, chunk_mode:
     info = (
         f"{stats['documents']} documentos → {stats['chunks']} chunks · "
         f"modo `{mode}` · chunking `{stats['chunk_mode']}` · "
-        f"índice denso {stats['dense_bytes'] / 1e6:.1f} MB + "
+        f"índice denso {stats['vector_bytes'] / 1e6:.1f} MB + "
         f"léxico {stats['lexical_bytes'] / 1e6:.1f} MB · "
         f"sem GPU, sem PyTorch"
     )

@@ -1,0 +1,14 @@
+{
+  "experiment": "quati_reranking_cxm25",
+  "task": "quati_reranking",
+  "task_name": "QuatiReranking",
+  "mode": "cxm25",
+  "chunk": "window",
+  "corpus_docs": 5991,
+  "queries": 50,
+  "chunks": 5991,
+  "index_build_s": 39.98,
+  "ms_per_query": 8.89,
+  "map_at_1000": 0.31,
+  "n_queries": 50.0
+}

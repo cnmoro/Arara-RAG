@@ -1,17 +1,31 @@
-"""The arara-rag pipeline: chunk, embed, index, retrieve, fuse, rerank."""
+"""The arara-rag pipeline: chunk, embed, index, retrieve, fuse, rerank.
+
+Two storage modes behind one API:
+
+* ``Arara()`` keeps everything in memory -- fastest, best for small corpora;
+* ``Arara(path="./index")`` is out-of-core and persistent: vectors live in a
+  memory-mapped file, documents, metadata and chunk offsets live in SQLite.
+
+Both support metadata filtering and CRUD. Deletes are tombstones with slot
+reuse, because a RAG index is read far more often than it is written.
+"""
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 
 from .chunk import Chunker, canonicalize
-from .dense import DEFAULT_DENSE_MODEL, DenseEncoder, DenseIndex, build_encoder
+from .dense import DEFAULT_DENSE_MODEL, DenseEncoder
 from .fuse import rank_from_scores, reciprocal_rank_fusion
 from .lexical import BM25Index, CXM25Scorer
+from .store import Catalog, ChunkRecord, MemCatalog, MemVectorStore, VectorStore
 from .text import Tokenizer
 from .types import Chunk, Hit
 
@@ -29,12 +43,7 @@ def _normalize_input(docs) -> list[tuple[str, str]]:
             else:
                 doc_id, text = item
                 items.append((str(doc_id), text))
-    out: list[tuple[str, str]] = []
-    for doc_id, text in items:
-        if text is None:
-            continue
-        out.append((str(doc_id), str(text)))
-    return out
+    return [(str(d), str(t)) for d, t in items if t is not None]
 
 
 class Arara:
@@ -42,40 +51,38 @@ class Arara:
 
     Example:
         >>> from arara_rag import Arara
-        >>> a = Arara()
-        >>> a.add_documents({"lei": "Art. 1o Esta lei ..." * 50})
-        >>> a.search("o que diz o artigo primeiro?", top_k=3)
+        >>> a = Arara(path="./meu_indice")
+        >>> a.add_documents({"lei": texto}, metadata={"ano": 2024})
+        >>> a.search("aliquota", top_k=5, where={"ano": {"$gte": 2020}})
 
     Args:
-        dense_model: HuggingFace id of a Model2Vec static embedding model.
-        chunk_mode: ``"tinyzchunk"`` (default), ``"paragraph"`` or ``"none"``.
-        max_chunk_chars: hard ceiling passed to the chunker.
-        min_chunk_chars: chunks below this are merged away by tinyzchunk.
-        candidate_k: how many chunks each retriever contributes to fusion.
-        rrf_k: RRF damping constant.
-        lexical: ``"bm25"`` (numpy, full-corpus) -- the fast first stage.
-        cxm25: build the optional CXM25 scorer for the ``hybrid_cxm25`` mode.
+        path: directory for a persistent, out-of-core index. ``None`` keeps
+            everything in memory.
+        dense_model: Model2Vec static embedding model.
+        chunk_mode: ``"tinyzchunk"`` (default), ``"window"``, ``"paragraph"``
+            or ``"document"``.
+        candidate_k: chunks each retriever contributes to fusion.
+        fusion_weights: ``(dense, lexical)`` weights for RRF.
     """
 
     def __init__(
         self,
+        path: str | Path | None = None,
         dense_model: str = DEFAULT_DENSE_MODEL,
-        dense_backend: str = "static",
         chunk_mode: str = "tinyzchunk",
         max_chunk_chars: int = 2500,
         min_chunk_chars: int = 100,
         candidate_k: int = 100,
         rrf_k: int = 60,
-        fusion_weights: tuple[float, float] = (1.0, 1.0),
+        fusion_weights: tuple[float, ...] = (1.0, 1.0),
         lang: str = "pt",
         cache_dir: str | None = None,
         encoder: DenseEncoder | None = None,
     ) -> None:
+        self.path = Path(path) if path is not None else None
         self.dense_model = dense_model
-        self.dense_backend = dense_backend
         self.candidate_k = candidate_k
         self.rrf_k = rrf_k
-        # (dense, lexical) weights for reciprocal rank fusion.
         self.fusion_weights = fusion_weights
         self.lang = lang
         self.chunker = Chunker(
@@ -87,298 +94,523 @@ class Arara:
         self._encoder = encoder
         self._cache_dir = cache_dir
 
-        self._doc_ids: list[str] = []
-        self._doc_text: dict[str, str] = {}
-        self._doc_to_chunks: dict[str, list[int]] = {}
-        self._chunks: list[Chunk] = []
-        self._chunk_doc_idx = np.empty(0, dtype=np.int64)
-        self._dense: DenseIndex | None = None
-        self._lex: BM25Index = BM25Index()
+        self._catalog: Catalog | MemCatalog = Catalog(self.path) if self.path else MemCatalog()
+        self._vectors: VectorStore | MemVectorStore | None = None
+        self._lex: BM25Index | None = None
+        self._lex_dirty = True
         self._cxm25: CXM25Scorer | None = None
+
+        # Fixed-size per-slot bookkeeping: 16 bytes per chunk, so it stays
+        # resident even when vectors, text and metadata do not.
+        self._slot_doc = np.empty(0, dtype=np.int32)
+        self._slot_ord = np.empty(0, dtype=np.int32)
+        self._slot_start = np.empty(0, dtype=np.int32)
+        self._slot_end = np.empty(0, dtype=np.int32)
+        self._doc_ids: list[str] = []
+        self._doc_index: dict[str, int] = {}
+        self._doc_alive: list[bool] = []
         self.timings: dict[str, float] = {}
+
+        if self.path is not None:
+            self._reopen()
+
+    # -- persistence --------------------------------------------------------
+    @property
+    def persistent(self) -> bool:
+        return self.path is not None
+
+    def _reopen(self) -> None:
+        """Rebuild slot bookkeeping from a catalog written by a previous run."""
+        doc_ids = self._catalog.document_ids()
+        if not doc_ids:
+            return
+        self._doc_ids = doc_ids
+        self._doc_index = {d: i for i, d in enumerate(doc_ids)}
+        self._doc_alive = [True] * len(doc_ids)
+        size = self._catalog.max_slot() + 1
+        self._slot_doc = np.full(size, -1, dtype=np.int32)
+        self._slot_ord = np.zeros(size, dtype=np.int32)
+        self._slot_start = np.zeros(size, dtype=np.int32)
+        self._slot_end = np.zeros(size, dtype=np.int32)
+        for row in self._catalog.slot_rows():
+            self._slot_doc[row.slot] = self._doc_index[row.doc_id]
+            self._slot_ord[row.slot] = int(row.chunk_id.rsplit("#", 1)[-1])
+            self._slot_start[row.slot] = row.start
+            self._slot_end[row.slot] = row.end
+        if size:
+            self._vectors = VectorStore(self.path)
+        if (self.path / "bm25_meta.json").exists():
+            self._lex = BM25Index.load(self.path)
+            self._lex_dirty = False
+
+    def flush(self) -> None:
+        """Persist catalog and vector metadata. Cheap; call after writes."""
+        self._catalog.commit()
+        if self._vectors is not None:
+            self._vectors.flush()
+
+    def close(self) -> None:
+        self.flush()
+        if self._vectors is not None:
+            self._vectors.close()
+        self._catalog.close()
+
+    def __enter__(self) -> "Arara":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # -- indexing -----------------------------------------------------------
     @property
     def encoder(self) -> DenseEncoder:
         if self._encoder is None:
-            model_id = self.dense_model if self.dense_backend == "static" else None
-            self._encoder = build_encoder(
-                self.dense_backend, model_id, cache_dir=self._cache_dir
-            )
+            self._encoder = DenseEncoder(self.dense_model, cache_dir=self._cache_dir)
         return self._encoder
 
     def __len__(self) -> int:
-        return len(self._doc_ids)
-
-    def document_text(self, doc_id: str) -> str:
-        """The canonical text that chunk offsets index into.
-
-        Line endings are normalised to ``\\n``; the text is otherwise identical
-        to what was passed to :meth:`add_documents`.
-        """
-        return self._doc_text[doc_id]
-
-    def resolve(self, hit: Hit) -> str:
-        """Return the exact source text a hit points at."""
-        if hit.start is None or hit.end is None:
-            raise ValueError("hit has no offsets")
-        return self._doc_text[hit.doc_id][hit.start : hit.end]
+        """Number of live documents."""
+        return int(sum(self._doc_alive))
 
     @property
     def n_chunks(self) -> int:
-        return len(self._chunks)
+        return int((self._slot_doc >= 0).sum())
 
-    def add_documents(self, docs, show_progress: bool = False) -> int:
-        """Chunk, embed and index documents. Returns the number of chunks added."""
+    def _metadata_for(self, doc_id: str, metadata) -> dict:
+        if metadata is None:
+            return {}
+        if isinstance(metadata, Mapping) and isinstance(metadata.get(doc_id), Mapping):
+            return dict(metadata[doc_id])
+        return dict(metadata)
+
+    def add_documents(self, docs, metadata=None, show_progress: bool = False) -> int:
+        """Chunk, embed and index documents. Returns the number of chunks added.
+
+        Re-adding an existing ``doc_id`` replaces that document: its old chunks
+        are tombstoned, their slots recycled, and the new version indexed. That
+        keeps a frequently edited index from growing forever.
+
+        Args:
+            docs: mapping or iterable of ``(doc_id, text)``.
+            metadata: dict applied to every document, or a mapping of
+                ``doc_id`` to dict.
+        """
         items = _normalize_input(docs)
         if not items:
             return 0
 
         t0 = time.perf_counter()
         new_chunks: list[Chunk] = []
-        new_doc_idx: list[int] = []
+        new_docs: list[int] = []
         for doc_id, text in items:
-            if doc_id in self._doc_ids:
-                raise ValueError(f"duplicate doc_id: {doc_id!r}")
-            base = len(self._doc_ids)
-            self._doc_ids.append(doc_id)
+            if self._catalog.has_document(doc_id):
+                self.delete_document(doc_id)
             canonical = canonicalize(text)
-            self._doc_text[doc_id] = canonical
-            idxs: list[int] = []
+            self._catalog.put_document(doc_id, canonical, self._metadata_for(doc_id, metadata))
+            if doc_id in self._doc_index:
+                di = self._doc_index[doc_id]
+                self._doc_alive[di] = True
+            else:
+                di = len(self._doc_ids)
+                self._doc_index[doc_id] = di
+                self._doc_ids.append(doc_id)
+                self._doc_alive.append(True)
             for chunk in self.chunker.split(doc_id, canonical):
-                idxs.append(len(new_chunks))
                 new_chunks.append(chunk)
-                new_doc_idx.append(base)
-            self._doc_to_chunks[doc_id] = idxs
+                new_docs.append(di)
         self.timings["chunk_s"] = time.perf_counter() - t0
         if not new_chunks:
+            self.flush()
             return 0
 
         t0 = time.perf_counter()
-        vectors = self.encoder.encode(
-            [c.text for c in new_chunks], show_progress=show_progress
-        )
+        vectors = self.encoder.encode([c.text for c in new_chunks], show_progress=show_progress)
         self.timings["encode_s"] = time.perf_counter() - t0
-
-        if self._dense is None:
-            self._dense = DenseIndex(dim=vectors.shape[1])
-        self._dense.add(vectors)
+        if self._vectors is None:
+            self._vectors = (
+                VectorStore(self.path, dim=vectors.shape[1])
+                if self.path is not None
+                else MemVectorStore(dim=vectors.shape[1])
+            )
+        slots = self._vectors.append(vectors)
 
         t0 = time.perf_counter()
-        terms = [self.tokenizer.terms(c.text) for c in new_chunks]
-        self._lex.add(terms)
-        self.timings["tokenize_s"] = time.perf_counter() - t0
-
-        self._chunks.extend(new_chunks)
-        self._chunk_doc_idx = np.concatenate(
-            [self._chunk_doc_idx, np.asarray(new_doc_idx, dtype=np.int64)]
+        self._place_slots(new_chunks, new_docs, slots)
+        self._catalog.add_chunks(
+            [
+                ChunkRecord(c.chunk_id, c.doc_id, int(s), c.start, c.end)
+                for c, s in zip(new_chunks, slots)
+            ]
         )
+        self._lex_dirty = True
+        self._cxm25 = None
+        self.timings["bookkeeping_s"] = time.perf_counter() - t0
+        self.flush()
         return len(new_chunks)
 
-    def finalize(self, build_cxm25: bool = False, n_jobs: int = 1) -> "Arara":
+    def _place_slots(self, chunks, doc_idx, slots: np.ndarray) -> None:
+        need = int(slots.max(initial=-1)) + 1
+        if need > self._slot_doc.size:
+            for name, fill in (
+                ("_slot_doc", -1),
+                ("_slot_ord", 0),
+                ("_slot_start", 0),
+                ("_slot_end", 0),
+            ):
+                old = getattr(self, name)
+                grown = np.full(need, fill, dtype=np.int32)
+                grown[: old.size] = old
+                setattr(self, name, grown)
+        self._slot_doc[slots] = np.asarray(doc_idx, dtype=np.int32)
+        self._slot_ord[slots] = np.asarray(
+            [int(c.chunk_id.rsplit("#", 1)[-1]) for c in chunks], dtype=np.int32
+        )
+        self._slot_start[slots] = np.asarray([c.start for c in chunks], dtype=np.int32)
+        self._slot_end[slots] = np.asarray([c.end for c in chunks], dtype=np.int32)
+
+    def finalize(self, build_cxm25: bool = False, n_jobs: int = 1, force_lexical: bool = False) -> "Arara":
         """Build derived structures. Call once after all documents are added."""
-        self._lex.finalize()
-        if self._dense is not None:
-            self._dense.finalize()
-        if build_cxm25 and self._cxm25 is None and self._chunks:
+        if force_lexical or self._lex_dirty or self._lex is None:
+            self._lex = self._build_lexical()
+            self._lex_dirty = False
+        if build_cxm25 and self._cxm25 is None and self._slot_doc.size:
+            # Indexed by *slot*, with empty text for dead slots, so that
+            # candidate ids stay valid after deletions.
+            texts = [
+                self._chunk_text(s) if int(self._slot_doc[s]) >= 0 else ""
+                for s in range(self._slot_doc.size)
+            ]
             t0 = time.perf_counter()
-            self._cxm25 = CXM25Scorer(
-                [c.text for c in self._chunks], tokenizer=self.tokenizer, n_jobs=n_jobs
-            )
+            self._cxm25 = CXM25Scorer(texts, tokenizer=self.tokenizer, n_jobs=n_jobs)
             self.timings["cxm25_build_s"] = time.perf_counter() - t0
         return self
 
+    def _build_lexical(self) -> BM25Index:
+        """Build BM25 indexed by *slot*.
+
+        Dead slots get empty term lists so that the BM25 document space matches
+        the slot space exactly. Compacting to live chunks only would silently
+        shift every id after the first deletion.
+        """
+        t0 = time.perf_counter()
+        idx = BM25Index()
+        n_slots = int(self._slot_doc.size)
+        terms: list[list[str]] = [[] for _ in range(n_slots)]
+        for doc_id in self._doc_ids:
+            if not self._doc_alive[self._doc_index[doc_id]]:
+                continue
+            if not self._catalog.has_document(doc_id):
+                continue
+            text = self._catalog.text_of(doc_id)
+            for r in sorted(self._catalog.chunks_of(doc_id), key=lambda r: r.start):
+                if 0 <= r.slot < n_slots:
+                    terms[r.slot] = self.tokenizer.terms(text[r.start : r.end])
+        idx.add(terms)
+        idx.finalize()
+        self.timings["lexical_s"] = time.perf_counter() - t0
+        if self.path is not None:
+            idx.save(self.path)
+        return idx
+
+    # -- CRUD ---------------------------------------------------------------
+    def delete_document(self, doc_id: str) -> bool:
+        """Remove a document. Its chunks are tombstoned and its slots recycled."""
+        di = self._doc_index.get(doc_id)
+        if di is None or not self._doc_alive[di]:
+            return False
+        slots = self._catalog.delete_document(doc_id)
+        if slots and self._vectors is not None:
+            self._vectors.release(slots)
+            self._slot_doc[np.asarray(slots, dtype=np.int64)] = -1
+        self._doc_alive[di] = False
+        self._lex_dirty = True
+        self._cxm25 = None
+        self.flush()
+        return True
+
+    def update_metadata(self, doc_id: str, metadata: dict, merge: bool = True) -> bool:
+        """Replace or merge a document's metadata without re-embedding it."""
+        current = self._catalog.get_document(doc_id)
+        if current is None:
+            return False
+        text, old = current
+        new = {**old, **metadata} if merge else dict(metadata)
+        self._catalog.put_document(doc_id, text, new)
+        self.flush()
+        return True
+
+    def get_document(self, doc_id: str) -> tuple[str, dict] | None:
+        """Return ``(text, metadata)``, or ``None`` if absent."""
+        return self._catalog.get_document(doc_id)
+
+    def document_text(self, doc_id: str) -> str:
+        """The canonical text that chunk offsets index into."""
+        return self._catalog.text_of(doc_id)
+
+    def resolve(self, hit: Hit) -> str:
+        """Return the exact source text a hit points at."""
+        if hit.start is None or hit.end is None:
+            raise ValueError("hit has no offsets")
+        return self._catalog.text_of(hit.doc_id)[hit.start : hit.end]
+
+    def compact(self) -> int:
+        """Rewrite the vector file without tombstoned slots.
+
+        Slots are recycled on write, so this reclaims space rather than fixing
+        correctness. Returns the live chunk count.
+        """
+        if self.path is None or self._vectors is None:
+            return self.n_chunks
+        live = self._live_slots()
+        if live.size == 0:
+            return 0
+
+        staging = Path(tempfile.mkdtemp(dir=str(self.path)))
+        store = VectorStore(staging, dim=self._vectors.dim, capacity=int(live.size))
+        store.append(self._vectors.gather(live))
+        store.flush()
+        store.close()
+
+        self._slot_doc = self._slot_doc[live]
+        self._slot_ord = self._slot_ord[live]
+        self._slot_start = self._slot_start[live]
+        self._slot_end = self._slot_end[live]
+
+        self._vectors.close()
+        for name in ("vectors.npy", "vectors.json"):
+            src, dst = staging / name, self.path / name
+            if src.exists():
+                dst.unlink(missing_ok=True)
+                src.replace(dst)
+        shutil.rmtree(staging, ignore_errors=True)
+        self._vectors = VectorStore(self.path)
+
+        records = []
+        for s in range(self._slot_doc.size):
+            doc_id = self._doc_ids[int(self._slot_doc[s])]
+            records.append(
+                ChunkRecord(
+                    chunk_id=f"{doc_id}#{int(self._slot_ord[s])}",
+                    doc_id=doc_id,
+                    slot=s,
+                    start=int(self._slot_start[s]),
+                    end=int(self._slot_end[s]),
+                )
+            )
+        self._catalog.replace_chunks(records)
+        self._lex_dirty = True
+        self.flush()
+        return self.n_chunks
+
     # -- retrieval ----------------------------------------------------------
+    def _live_slots(self) -> np.ndarray:
+        if self._slot_doc.size == 0:
+            return np.empty(0, dtype=np.int64)
+        return np.nonzero(self._slot_doc >= 0)[0].astype(np.int64)
+
+    def _allowed(self, where: dict | None) -> np.ndarray | None:
+        """Live slots restricted by ``where``; ``None`` means 'all of them'."""
+        live = self._live_slots()
+        filtered = self._catalog.filter_slots(where)
+        if filtered is None:
+            return None if live.size == self._slot_doc.size else live
+        return np.intersect1d(live, filtered, assume_unique=True)
+
+    def _chunk_text(self, slot: int) -> str:
+        di = int(self._slot_doc[slot])
+        text = self._catalog.text_of(self._doc_ids[di])
+        return text[int(self._slot_start[slot]) : int(self._slot_end[slot])]
+
+    def _hit(self, slot: int, score: float) -> Hit:
+        di = int(self._slot_doc[slot])
+        doc_id = self._doc_ids[di]
+        return Hit(
+            doc_id=doc_id,
+            score=float(score),
+            chunk_id=f"{doc_id}#{int(self._slot_ord[slot])}",
+            text=self._chunk_text(slot),
+            start=int(self._slot_start[slot]),
+            end=int(self._slot_end[slot]),
+        )
+
+    def _prepare(self, where: dict | None):
+        if self._slot_doc.size == 0:
+            return None, None, False
+        allowed = self._allowed(where)
+        if allowed is not None and allowed.size == 0:
+            return None, None, False
+        if self._lex is None or self._lex_dirty:
+            self.finalize()
+        mask = None
+        if allowed is not None:
+            mask = np.zeros(self._slot_doc.size, dtype=bool)
+            mask[allowed] = True
+        return allowed, mask, True
+
     def search(
         self,
         query: str,
         top_k: int = 10,
         mode: SearchMode = "hybrid",
-        aggregate: str = "max",
+        where: dict | None = None,
     ) -> list[Hit]:
-        """Retrieve documents for ``query``.
+        """Retrieve documents, optionally filtered by metadata.
 
-        Chunk scores are aggregated to document level with ``max``, the standard
-        choice when a document is indexed as several spans.
+        ``where`` uses a MongoDB-like syntax:
+        ``{"ano": {"$gte": 2020}, "tipo": {"$in": ["lei", "decreto"]}}``.
         """
-        if not self._chunks:
+        allowed, mask, ok = self._prepare(where)
+        if not ok:
             return []
-        if mode == "hybrid_cxm25" and self._cxm25 is None:
-            self.finalize(build_cxm25=True)
 
         rankings: list[list[int]] = []
         weights: list[float] = []
-        single_scores: dict[int, float] | None = None
-        chunk_scores: dict[int, float]
+        single: dict[int, float] | None = None
 
-        if mode in ("dense", "hybrid", "hybrid_cxm25"):
-            qv = self.encoder.encode([query])[0]
-            ds, didx = self._dense.search(qv, self.candidate_k)  # type: ignore[union-attr]
+        if mode in ("dense", "hybrid", "hybrid_cxm25") and self._vectors is not None:
+            ds, didx = self._vectors.search(
+                self.encoder.encode([query])[0], self.candidate_k, allowed
+            )
             rankings.append([int(i) for i in didx])
             weights.append(self.fusion_weights[0])
             if mode == "dense":
-                single_scores = {int(i): float(s) for s, i in zip(ds, didx)}
+                single = {int(i): float(s) for s, i in zip(ds, didx)}
 
         if mode in ("lexical", "hybrid", "hybrid_cxm25"):
-            terms = self.tokenizer.terms(query)
-            ls, lidx = self._lex.search(terms, self.candidate_k)
+            ls, lidx = self._lex.search(self.tokenizer.terms(query), self.candidate_k, mask=mask)
             rankings.append([int(i) for i in lidx])
             weights.append(self.fusion_weights[1])
             if mode == "lexical":
-                single_scores = {int(i): float(s) for s, i in zip(ls, lidx)}
+                single = {int(i): float(s) for s, i in zip(ls, lidx)}
+
+        if not rankings:
+            return []
 
         if mode == "hybrid_cxm25" and self._cxm25 is not None:
             fused = reciprocal_rank_fusion(rankings, k=self.rrf_k, weights=weights)
             cand = [c for c, _ in rank_from_scores(fused, self.candidate_k)]
             scores = self._cxm25.score_candidates(query, cand)
             chunk_scores = {c: float(s) for c, s in zip(cand, scores)}
-        elif single_scores is not None:
-            chunk_scores = single_scores
-        elif len(rankings) == 1:
-            chunk_scores = {
-                c: 1.0 / (self.rrf_k + r) for r, c in enumerate(rankings[0], start=1)
-            }
+        elif single is not None:
+            chunk_scores = single
         else:
             chunk_scores = reciprocal_rank_fusion(rankings, k=self.rrf_k, weights=weights)
 
         doc_scores: dict[int, float] = {}
-        doc_best_chunk: dict[int, int] = {}
-        for chunk_idx, score in chunk_scores.items():
-            doc_idx = int(self._chunk_doc_idx[chunk_idx])
-            if score > doc_scores.get(doc_idx, -np.inf):
-                doc_scores[doc_idx] = score
-                doc_best_chunk[doc_idx] = chunk_idx
+        doc_chunk: dict[int, int] = {}
+        for slot, score in chunk_scores.items():
+            di = int(self._slot_doc[slot])
+            if di < 0:
+                continue
+            if score > doc_scores.get(di, -np.inf):
+                doc_scores[di] = score
+                doc_chunk[di] = slot
+        return [self._hit(doc_chunk[d], s) for d, s in rank_from_scores(doc_scores, top_k)]
 
-        hits: list[Hit] = []
-        for doc_idx, score in rank_from_scores(doc_scores, top_k):
-            chunk = self._chunks[doc_best_chunk[doc_idx]]
-            hits.append(
-                Hit(
-                    doc_id=self._doc_ids[doc_idx],
-                    score=float(score),
-                    chunk_id=chunk.chunk_id,
-                    text=chunk.text,
-                    start=chunk.start,
-                    end=chunk.end,
-                )
-            )
-        return hits
-
-    def search_chunks(self, query: str, top_k: int = 10, mode: SearchMode = "hybrid") -> list[Hit]:
+    def search_chunks(
+        self, query: str, top_k: int = 10, mode: SearchMode = "hybrid", where: dict | None = None
+    ) -> list[Hit]:
         """Like :meth:`search` but returns chunk-level hits without doc pooling."""
-        if not self._chunks:
+        allowed, mask, ok = self._prepare(where)
+        if not ok:
             return []
         rankings: list[list[int]] = []
-        weights: list[float] = []
-        if mode in ("dense", "hybrid", "hybrid_cxm25"):
-            qv = self.encoder.encode([query])[0]
-            _, idx = self._dense.search(qv, top_k)  # type: ignore[union-attr]
+        if mode in ("dense", "hybrid", "hybrid_cxm25") and self._vectors is not None:
+            _, idx = self._vectors.search(self.encoder.encode([query])[0], top_k, allowed)
             rankings.append([int(i) for i in idx])
-            weights.append(self.fusion_weights[0])
         if mode in ("lexical", "hybrid", "hybrid_cxm25"):
-            _, idx = self._lex.search(self.tokenizer.terms(query), top_k)
+            _, idx = self._lex.search(self.tokenizer.terms(query), top_k, mask=mask)
             rankings.append([int(i) for i in idx])
-            weights.append(self.fusion_weights[1])
+        if not rankings:
+            return []
         fused = (
-            reciprocal_rank_fusion(rankings, k=self.rrf_k, weights=weights)
+            reciprocal_rank_fusion(rankings, k=self.rrf_k)
             if len(rankings) > 1
             else {c: 1.0 / (self.rrf_k + r) for r, c in enumerate(rankings[0], start=1)}
         )
-        out = []
-        for chunk_idx, score in rank_from_scores(fused, top_k):
-            c = self._chunks[chunk_idx]
-            out.append(
-                Hit(
-                    doc_id=c.doc_id,
-                    score=float(score),
-                    chunk_id=c.chunk_id,
-                    text=c.text,
-                    start=c.start,
-                    end=c.end,
-                )
-            )
-        return out
+        return [self._hit(slot, score) for slot, score in rank_from_scores(fused, top_k)]
 
-    def retrieve_ranking(self, query: str, depth: int = 100, mode: SearchMode = "hybrid") -> list[str]:
+    def retrieve_ranking(
+        self, query: str, depth: int = 100, mode: SearchMode = "hybrid", where: dict | None = None
+    ) -> list[str]:
         """Ranked doc ids, for benchmark harnesses."""
-        return [h.doc_id for h in self.search(query, top_k=depth, mode=mode)]
+        return [h.doc_id for h in self.search(query, top_k=depth, mode=mode, where=where)]
 
-    def score_documents(
-        self, query: str, doc_ids, mode: str = "lexical"
-    ) -> dict[str, float]:
-        """Score a fixed candidate set of documents for ``query``.
-
-        This is the reranking path: the candidate list is given, and only the
-        order within it is decided. A document's score is the best score among
-        its chunks. Documents with no indexed chunks score ``-inf``.
-
-        ``mode="hybrid"`` fuses the dense and lexical *document* rankings with
-        RRF, using :attr:`fusion_weights`.
-        """
+    def score_documents(self, query: str, doc_ids, mode: str = "lexical") -> dict[str, float]:
+        """Score a fixed candidate set of documents (the reranking path)."""
         ids = list(dict.fromkeys(str(d) for d in doc_ids))
-        chunk_map = {d: self._doc_to_chunks.get(d, []) for d in ids}
         out = {d: float("-inf") for d in ids}
-        present = {d: cs for d, cs in chunk_map.items() if cs}
+        slots_of: dict[str, list[int]] = {}
+        for d in ids:
+            di = self._doc_index.get(d)
+            if di is None or not self._doc_alive[di]:
+                slots_of[d] = []
+                continue
+            slots_of[d] = [r.slot for r in self._catalog.chunks_of(d)]
+        present = {d: s for d, s in slots_of.items() if s}
         if not present:
             return out
+        if self._lex is None or self._lex_dirty:
+            self.finalize()
 
-        dense_scores = lex_scores = cxm25_scores = None
-        if mode in ("dense", "hybrid"):
-            dense_scores = self._dense.score_all(self.encoder.encode([query])[0])  # type: ignore[union-attr]
+        flat = [c for s in present.values() for c in s]
         if mode in ("lexical", "hybrid"):
-            lex_scores = self._lex.score_all(self.tokenizer.terms(query))
+            lex = self._lex.score_all(self.tokenizer.terms(query))
+        if mode in ("dense", "hybrid") and self._vectors is not None:
+            dense = self._vectors.gather(flat) @ self.encoder.encode([query])[0]
+            dense_map = dict(zip(flat, (float(v) for v in dense)))
         if mode == "cxm25":
             if self._cxm25 is None:
                 self.finalize(build_cxm25=True)
-            flat = [c for cs in present.values() for c in cs]
-            vals = self._cxm25.score_candidates(query, flat)  # type: ignore[union-attr]
-            cxm25_scores = dict(zip(flat, (float(v) for v in vals)))
+            vals = self._cxm25.score_candidates(query, flat)
+            cxm25_map = dict(zip(flat, (float(v) for v in vals)))
 
         if mode == "cxm25":
             for d, cs in present.items():
-                out[d] = max(cxm25_scores[c] for c in cs)  # type: ignore[index]
+                out[d] = max(cxm25_map[c] for c in cs)
         elif mode == "hybrid":
-            d_doc = {d: max(float(dense_scores[c]) for c in cs) for d, cs in present.items()}  # type: ignore[index]
-            l_doc = {d: max(float(lex_scores[c]) for c in cs) for d, cs in present.items()}  # type: ignore[index]
+            d_doc = {d: max(dense_map[c] for c in cs) for d, cs in present.items()}
+            l_doc = {d: max(float(lex[c]) for c in cs) for d, cs in present.items()}
             d_rank = {d: r for r, d in enumerate(sorted(d_doc, key=lambda x: -d_doc[x]), 1)}
             l_rank = {d: r for r, d in enumerate(sorted(l_doc, key=lambda x: -l_doc[x]), 1)}
-            dw, lw = self.fusion_weights
+            dw, lw = self.fusion_weights[0], self.fusion_weights[1]
             for d in present:
                 out[d] = dw / (self.rrf_k + d_rank[d]) + lw / (self.rrf_k + l_rank[d])
         elif mode == "dense":
             for d, cs in present.items():
-                out[d] = max(float(dense_scores[c]) for c in cs)  # type: ignore[index]
+                out[d] = max(dense_map[c] for c in cs)
         elif mode == "lexical":
             for d, cs in present.items():
-                out[d] = max(float(lex_scores[c]) for c in cs)  # type: ignore[index]
+                out[d] = max(float(lex[c]) for c in cs)
         else:
             raise ValueError(f"unknown scoring mode: {mode!r}")
         return out
 
-    def rerank(
-        self, query: str, doc_ids, mode: str = "cxm25", top_k: int | None = None
-    ) -> list[str]:
+    def rerank(self, query: str, doc_ids, mode: str = "cxm25", top_k: int | None = None) -> list[str]:
         """Return ``doc_ids`` reordered best-first. Unscorable docs go last."""
         scores = self.score_documents(query, doc_ids, mode=mode)
-        order = sorted(scores.items(), key=lambda kv: (-kv[1], str(kv[0])))
-        ranked = [d for d, _ in order]
+        ranked = [d for d, _ in sorted(scores.items(), key=lambda kv: (-kv[1], str(kv[0])))]
         return ranked[:top_k] if top_k else ranked
 
     # -- introspection ------------------------------------------------------
     def stats(self) -> dict:
-        dense_bytes = self._dense.nbytes if self._dense is not None else 0
+        vector_bytes = self._vectors.nbytes if self._vectors is not None else 0
+        file_bytes = self._vectors.file_bytes if self._vectors is not None else 0
         return {
-            "documents": len(self._doc_ids),
-            "chunks": len(self._chunks),
-            "dense_backend": self.dense_backend,
-            "dense_model": (
-                self.dense_model if self.dense_backend == "static"
-                else getattr(self._encoder, "model_id", self.dense_backend)
-            ),
-            "dense_bytes": dense_bytes,
-            "lexical_bytes": self._lex.nbytes,
-            "lexical_backend": self._lex.__class__.__name__,
+            "documents": len(self),
+            "deleted_documents": len(self._doc_ids) - len(self),
+            "chunks": self.n_chunks,
+            "slots_allocated": int(self._slot_doc.size),
+            "slot_bookkeeping_bytes": int(self._slot_doc.size * 16),
+            "dense_backend": "model2vec/numpy",
+            "dense_model": self.dense_model,
+            "vector_bytes": vector_bytes,
+            "vector_file_bytes": file_bytes,
+            "lexical_bytes": self._lex.nbytes if self._lex is not None else 0,
+            "lexical_backend": "BM25Index",
             "tokenizer": self.tokenizer.backend,
             "chunk_mode": self.chunker.mode,
+            "persistent": self.persistent,
+            "path": str(self.path) if self.path else None,
             "timings": dict(self.timings),
         }

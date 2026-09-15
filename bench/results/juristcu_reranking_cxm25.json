@@ -1,0 +1,14 @@
+{
+  "experiment": "juristcu_reranking_cxm25",
+  "task": "juristcu_reranking",
+  "task_name": "JurisTCUReranking",
+  "mode": "cxm25",
+  "chunk": "window",
+  "corpus_docs": 7429,
+  "queries": 150,
+  "chunks": 7429,
+  "index_build_s": 13.46,
+  "ms_per_query": 2.93,
+  "map_at_1000": 0.4845,
+  "n_queries": 150.0
+}

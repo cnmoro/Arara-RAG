@@ -1,0 +1,28 @@
+{
+  "experiment": "brtaxqa_capped_document_dense",
+  "task": "brtaxqa_capped",
+  "chunk": "document",
+  "mode": "dense",
+  "dense_weight": 1.0,
+  "lexical_weight": 1.0,
+  "max_chunk_chars": 2500,
+  "corpus_docs": 478,
+  "queries": 598,
+  "chunks": 478,
+  "index_build_s": 12.91,
+  "query_total_s": 0.29,
+  "ms_per_query": 0.49,
+  "vector_bytes": 734208,
+  "lexical_bytes": 1647332,
+  "ndcg_at_10": 0.1496,
+  "recall_at_10": 0.1756,
+  "mrr_at_10": 0.2155,
+  "ndcg_at_100": 0.2163,
+  "recall_at_100": 0.4351,
+  "mrr_at_100": 0.2269,
+  "n_queries": 598.0,
+  "task_meta": {
+    "doc_char_cap": 32000,
+    "n_docs_truncated": 107
+  }
+}

@@ -11,6 +11,8 @@ Two scorers, used at different stages for a reason:
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from .text import Tokenizer
@@ -108,8 +110,11 @@ class BM25Index:
         self._doc_lens = lens  # type: ignore[assignment]
         return self
 
-    def score_all(self, terms) -> np.ndarray:
-        """BM25 score of every document, in index order."""
+    def score_all(self, terms, mask: np.ndarray | None = None) -> np.ndarray:
+        """BM25 score of every document, in index order.
+
+        ``mask`` is a boolean array over slots; masked-out entries score 0.
+        """
         if self._indptr is None:
             self.finalize()
         n = self._n_docs
@@ -129,11 +134,13 @@ class BM25Index:
             dl = self._doc_lens[docs]
             denom = tf + k1 * (1.0 - b + b * dl / avgdl)
             scores[docs] += self._idf[tid] * (tf * (k1 + 1.0)) / denom
+        if mask is not None:
+            scores = np.where(mask, scores, 0.0)
         return scores
 
-    def search(self, terms, top_k: int = 100):
+    def search(self, terms, top_k: int = 100, mask: np.ndarray | None = None):
         """Return ``(scores, doc_indices)`` for the top ``top_k`` documents."""
-        scores = self.score_all(terms)
+        scores = self.score_all(terms, mask=mask)
         n = scores.shape[0]
         if n == 0:
             return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int64)
@@ -141,7 +148,60 @@ class BM25Index:
         part = np.argpartition(-scores, k - 1)[:k] if k < n else np.arange(n)
         cand_s = scores[part]
         order = np.argsort(-cand_s, kind="stable")
-        return cand_s[order], part[order].astype(np.int64)
+        idx = part[order].astype(np.int64)
+        vals = cand_s[order]
+        if mask is not None:
+            keep = vals > 0
+            idx, vals = idx[keep], vals[keep]
+        return vals, idx
+
+    # -- persistence --------------------------------------------------------
+    def save(self, directory) -> None:
+        """Write the inverted index to ``directory`` as ``.npy`` arrays."""
+        from pathlib import Path
+
+        self.finalize()
+        d = Path(directory)
+        d.mkdir(parents=True, exist_ok=True)
+        np.save(d / "bm25_indptr.npy", self._indptr)
+        np.save(d / "bm25_indices.npy", self._indices)
+        np.save(d / "bm25_data.npy", self._data)
+        np.save(d / "bm25_idf.npy", self._idf)
+        np.save(d / "bm25_doclen.npy", np.asarray(self._doc_lens, dtype=np.float32))
+        (d / "bm25_meta.json").write_text(
+            json.dumps(
+                {
+                    "k1": self.k1,
+                    "b": self.b,
+                    "avgdl": self._avgdl,
+                    "n_docs": self._n_docs,
+                    "vocab": self._vocab,
+                }
+            )
+        )
+
+    @classmethod
+    def load(cls, directory, mmap: bool = True) -> "BM25Index":
+        """Load an inverted index written by :meth:`save`.
+
+        With ``mmap=True`` the postings are paged from disk instead of being
+        read into the process, which is what keeps a large index out of RAM.
+        """
+        from pathlib import Path
+
+        d = Path(directory)
+        meta = json.loads((d / "bm25_meta.json").read_text())
+        obj = cls(k1=meta["k1"], b=meta["b"])
+        mode = "r" if mmap else None
+        obj._indptr = np.load(d / "bm25_indptr.npy", mmap_mode=mode)
+        obj._indices = np.load(d / "bm25_indices.npy", mmap_mode=mode)
+        obj._data = np.load(d / "bm25_data.npy", mmap_mode=mode)
+        obj._idf = np.load(d / "bm25_idf.npy", mmap_mode=mode)
+        obj._doc_lens = np.load(d / "bm25_doclen.npy", mmap_mode=mode)
+        obj._avgdl = float(meta["avgdl"])
+        obj._n_docs = int(meta["n_docs"])
+        obj._vocab = {k: int(v) for k, v in meta["vocab"].items()}
+        return obj
 
 
 class CXM25Scorer:

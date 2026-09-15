@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arara-rag"
-version = "0.1.0"
-description = "Portuguese-first, CPU-only RAG retrieval: chunking, static embeddings, hybrid search and lexical reranking with numpy and no PyTorch."
+version = "0.3.0"
+description = "Portuguese-first, CPU-only retrieval: tinyzchunk chunking, static embeddings, BM25, rank fusion and CXM25 reranking. numpy only, out-of-core, with metadata filtering and CRUD."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Carlo Moro" }]
-keywords = ["rag", "retrieval", "portuguese", "pt-br", "embeddings", "bm25", "cpu", "numpy"]
+keywords = ["rag", "retrieval", "portuguese", "pt-br", "embeddings", "bm25", "cpu", "numpy", "out-of-core"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
@@ -27,10 +27,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Alternative dense backend: USE-multilingual v3 in pure numpy (512-d).
-use = ["fast-universal-sentence-encoder>=0.2"]
 # The benchmark harness is the only thing that needs the heavy stack.
-bench = ["datasets>=2.19", "pyarrow", "huggingface_hub>=0.23"]
+bench = ["datasets>=2.19", "pyarrow", "huggingface_hub>=0.23", "matplotlib>=3.8"]
 validate = ["pytrec_eval-terrier>=0.5.6"]
 dev = ["pytest>=7"]
 
