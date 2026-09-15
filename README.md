@@ -63,15 +63,31 @@ One CPU core, no GPU. Measured end to end with `python -m bench.profile`.
 MTEB-BR, the Brazilian Portuguese benchmark with a
 [public leaderboard](https://huggingface.co/spaces/MTEB-BR/leaderboard).
 nDCG@10, fixed-window chunking. Metrics are computed by `bench/metrics.py`,
-which `bench/validate_metrics.py` checks against `pytrec_eval` to **0.0e+00**.
+which `bench/validate_metrics.py` checks against `pytrec_eval` to **0.0e+00**,
+and against scikit-learn on binary relevance.
 
-| Task | docs | dense | lexical | hybrid |
-|---|---|---|---|---|
-| BRTaxQAR (capped) | 478 | 0.2934 | **0.4051** | 0.3486 |
-| FaQuADIR | 244 | 0.7139 | **0.8961** | 0.8304 |
-| FaqBacenRetrieval | 1,673 | 0.3745 | **0.4881** | 0.4526 |
-| JurisTCU | 16,045 | 0.3887 | **0.5378** | 0.4890 |
-| Quati | 50,000 | 0.3268 | **0.4067** | 0.4046 |
+| Task | docs | rel./query | MRR@10 | dense | lexical | hybrid |
+|---|---|---|---|---|---|---|
+| BRTaxQAR (capped) | 478 | 2.92 | 0.516 | 0.2934 | **0.4051** | 0.3486 |
+| FaQuADIR | 244 | 1.0 | 0.873 | 0.7139 | **0.8961** | 0.8304 |
+| FaqBacenRetrieval | 1,673 | 1.0 | 0.433 | 0.3744 | **0.4881** | 0.4526 |
+| JurisTCU | 16,045 | 15.0 | 0.821 | 0.3887 | **0.5378** | 0.4890 |
+| Quati | 50,000 | 38.66 | 0.676 | 0.3268 | **0.4067** | 0.4046 |
+
+**Read `rel./query` before comparing across rows.** nDCG@10 measures very
+different things on these tasks, and that is a property of the benchmarks rather
+than of the retrieval:
+
+- **FaQuADIR and FaqBacen have exactly one relevant document per query.** There
+  nDCG@10 is a transform of the rank of that one document, so 0.90 means it is
+  usually first and 1.0 is the ceiling.
+- **Quati has 38.66 relevant documents per query.** With ten slots, a perfect
+  score requires all ten to be relevant, so 0.41 means roughly four of the top
+  ten are relevant — much closer to precision at 10 than the FaQuADIR number is.
+- JurisTCU (15.0) and BRTaxQAR (2.92) sit in between.
+
+A retriever scoring 0.33 on Quati is therefore not "worse" than one scoring 0.71
+on FaQuADIR — the numbers are not comparable across rows, only within one.
 
 CXM25 reranking on top of the hybrid adds **+0.018 to +0.077 nDCG@10** across
 these tasks for 1–6 ms per query (FaQuADIR: 0.8304 → **0.9078**,

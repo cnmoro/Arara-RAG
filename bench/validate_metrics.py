@@ -8,6 +8,8 @@ from __future__ import annotations
 import random
 import sys
 
+import numpy as np
+
 sys.path.insert(0, ".")
 from bench.metrics import (
     average_precision_at_k,
@@ -84,6 +86,35 @@ worst_ap = max(
 )
 print(f"{'OK ' if worst_ap < 1e-9 else 'FAIL'} per-query max map_at_1000 delta = {worst_ap:.2e}")
 ok = ok and worst_ap < 1e-9
+
+# Independent check against scikit-learn. Its NDCG uses exponential gain, which
+# coincides with trec_eval's linear gain only when relevance is binary, so the
+# comparison is run on binary judgements.
+try:
+    from sklearn.metrics import ndcg_score
+
+    binary = {q: {d: 1 for d, v in rel.items() if v > 0} for q, rel in qrels.items()}
+    docs = doc_ids
+    index = {d: i for i, d in enumerate(docs)}
+    vecs, refs = [], []
+    for qid, rel in binary.items():
+        relvec = np.zeros(len(docs))
+        for d in rel:
+            relvec[index[d]] = 1
+        score = np.full(len(docs), -1.0)
+        for rank, d in enumerate(rankings[qid]):
+            score[index[d]] = -rank
+        vecs.append(score)
+        refs.append(relvec)
+    sk = sum(ndcg_score([refs[i]], [vecs[i]], k=10) for i in range(len(vecs))) / len(vecs)
+    mine_bin = sum(ndcg_at_k(rankings[q], binary[q], 10) for q in binary) / len(binary)
+    delta = abs(mine_bin - sk)
+    if delta >= 1e-9:
+        ok = False
+    print(f"{'OK ' if delta < 1e-9 else 'FAIL'} {'vs sklearn':15s} "
+          f"arara={mine_bin:.12f}  sklearn={sk:.12f}  delta={delta:.2e}")
+except ImportError:
+    print("     sklearn not installed; skipping the independent NDCG check")
 
 print("\nRESULT:", "metrics match pytrec_eval" if ok else "MISMATCH")
 raise SystemExit(0 if ok else 1)

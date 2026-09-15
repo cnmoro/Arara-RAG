@@ -155,6 +155,9 @@ def run_experiment(
         "max_chunk_chars": exp.max_chunk_chars,
         "corpus_docs": len(task.corpus),
         "queries": len(task.queries),
+        "rel_per_query": round(
+            sum(len(v) for v in task.qrels.values()) / max(len(task.qrels), 1), 2
+        ),
         "chunks": stats["chunks"],
         "index_build_s": round(build_s, 2),
         "query_total_s": round(query_s, 2),

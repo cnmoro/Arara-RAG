@@ -56,17 +56,20 @@ def readme_tables(base: Path | None = None) -> str:
     by_task: dict[str, dict[str, dict]] = {}
     for r in core:
         by_task.setdefault(r["task"], {})[r["mode"]] = r
-    lines = ["| Task | docs | dense | lexical | hybrid | best |", "|---|---|---|---|---|---|"]
+    lines = ["| Task | docs | rel./query | MRR@10 | dense | lexical | hybrid | best |", "|---|---|---|---|---|---|---|---|"]
     for t in order:
         modes = by_task.get(t)
         if not modes:
             continue
         cells = {m: modes.get(m, {}).get("ndcg_at_10") for m in ("dense", "lexical", "hybrid")}
         best = max((m for m in cells if cells[m] is not None), key=lambda m: cells[m])
-        fmt = lambda v: f"{v:.4f}" if v is not None else "-"  # noqa: E731
+        fmt = lambda v, d=4: f"{v:.{d}f}" if v is not None else "-"  # noqa: E731
+        lex = modes.get("lexical", {})
         lines.append(
-            f"| {names[t]} | {modes['dense']['corpus_docs']} | {fmt(cells['dense'])} | "
-            f"{fmt(cells['lexical'])} | {fmt(cells['hybrid'])} | **{best}** |"
+            f"| {names[t]} | {modes['dense']['corpus_docs']} | "
+            f"{lex.get('rel_per_query', '-')} | {fmt(lex.get('mrr_at_10'), 3)} | "
+            f"{fmt(cells['dense'])} | {fmt(cells['lexical'])} | {fmt(cells['hybrid'])} | "
+            f"**{best}** |"
         )
     out = ["**Cross-task, nDCG@10** (fixed-window chunking; these corpora are mostly "
            "single-chunk documents, so this isolates dense vs lexical vs fusion)\n"]
