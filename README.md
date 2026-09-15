@@ -42,11 +42,13 @@ One CPU core, no GPU. Measured end to end with `python -m bench.profile`.
 
 | documents | index build | query p50 | query p95 | index size | peak RSS to serve |
 |---|---|---|---|---|---|
-| 1,000 | 6.7 s | **0.44 ms** | 0.48 ms | 1.8 MB | 473 MB |
-| 10,000 | 70 s | **0.86 ms** | 4.2 ms | 18 MB | 482 MB |
-| 50,000 | 382 s | **7.1 ms** | 8.3 ms | 91 MB | 555 MB |
+| 1,000 | 3.1 s | **0.45 ms** | 0.54 ms | 1.8 MB | 472 MB |
+| 10,000 | 8.8 s | **0.86 ms** | 6.8 ms | 18 MB | 481 MB |
+| 50,000 | 33.8 s | **7.0 ms** | 8.0 ms | 91 MB | 553 MB |
 
-- **~130–150 documents/second** to chunk, embed, tokenise and index.
+- **~1,300–1,500 documents/second** to chunk, embed, tokenise and index —
+  chunking and embedding are per-document, so they run across processes.
+  A single process manages ~300/second.
 - **~1.8 KB per document** of index: 1.5 KB of vectors plus BM25 postings.
 - Query latency scales with corpus size because both retrievers score the whole
   corpus per query — that is what makes the ranking exact rather than
@@ -186,6 +188,9 @@ space/          Gradio demo
 - **Per-chunk bookkeeping stays resident** (16 bytes/chunk); vectors, text and
   metadata do not.
 - **CXM25 reranking is ~71 µs/document**, so it runs over a candidate set.
+- **Index build forks worker processes** to parallelise chunking and embedding.
+  Set `workers=1` where forking is unsafe or unavailable; the result is
+  byte-identical, only slower.
 
 ## License
 

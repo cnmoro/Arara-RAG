@@ -2,10 +2,10 @@
   {
     "documents": 1000,
     "chunks": 1000,
-    "rss_baseline_mb": 34.4,
+    "rss_baseline_mb": 35.2,
     "rss_after_open_mb": 58.4,
-    "rss_after_queries_mb": 507.1,
-    "rss_to_serve_mb": 472.7,
+    "rss_after_queries_mb": 507.0,
+    "rss_to_serve_mb": 471.8,
     "vector_bytes": 1536000,
     "lexical_bytes": 294880,
     "slot_bookkeeping_bytes": 16000
@@ -13,10 +13,10 @@
   {
     "documents": 10000,
     "chunks": 10000,
-    "rss_baseline_mb": 34.4,
-    "rss_after_open_mb": 62.6,
-    "rss_after_queries_mb": 516.6,
-    "rss_to_serve_mb": 482.2,
+    "rss_baseline_mb": 35.2,
+    "rss_after_open_mb": 62.9,
+    "rss_after_queries_mb": 516.2,
+    "rss_to_serve_mb": 481.0,
     "vector_bytes": 15360000,
     "lexical_bytes": 2869704,
     "slot_bookkeeping_bytes": 160000
@@ -24,10 +24,10 @@
   {
     "documents": 50000,
     "chunks": 50000,
-    "rss_baseline_mb": 34.4,
-    "rss_after_open_mb": 84.0,
-    "rss_after_queries_mb": 589.2,
-    "rss_to_serve_mb": 554.8,
+    "rss_baseline_mb": 35.2,
+    "rss_after_open_mb": 84.3,
+    "rss_after_queries_mb": 588.1,
+    "rss_to_serve_mb": 552.9,
     "vector_bytes": 76800000,
     "lexical_bytes": 14345384,
     "slot_bookkeeping_bytes": 800000

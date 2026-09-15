@@ -12,10 +12,13 @@ reuse, because a RAG index is read far more often than it is written.
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
 import shutil
 import tempfile
 import time
 from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -30,6 +33,65 @@ from .text import Tokenizer
 from .types import Chunk, Hit
 
 SearchMode = Literal["dense", "lexical", "hybrid", "hybrid_cxm25"]
+
+# Chunking and embedding dominate index build, and both are per-document, so
+# they parallelise across processes almost linearly. Below this many documents
+# the pool costs more than it saves.
+PARALLEL_MIN_DOCS = 64
+DEFAULT_MAX_WORKERS = 8
+
+# Forked children inherit these; nothing is pickled except the work items and
+# the results. The catalog and vector store are never touched by a child.
+_WORKER_STATE: dict = {}
+
+
+def _limit_threads():
+    """Cap BLAS to one thread, if threadpoolctl is available.
+
+    OpenBLAS sizes its thread team from the core count, but a per-document
+    matmul (a few hundred rows) is far too small to amortise that: 2000
+    documents cost 7.8 s on 16 threads against 2.1 s on one. Inside a process
+    pool the oversubscription compounds.
+    """
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:  # pragma: no cover - optional
+        return None
+    return threadpool_limits(limits=1)
+
+
+def _worker_prepare(item):
+    """Chunk and embed one document. Must stay module level and picklable."""
+    doc_id, canonical = item
+    chunker = _WORKER_STATE["chunker"]
+    encoder = _WORKER_STATE["encoder"]
+    limit = _limit_threads()
+    if limit is None:
+        chunks = chunker.split(doc_id, canonical)
+        texts = [c.text for c in chunks]
+        vectors = encoder.encode(texts) if texts else _empty(encoder.dim)
+        return chunks, vectors
+    with limit:
+        chunks = chunker.split(doc_id, canonical)
+        texts = [c.text for c in chunks]
+        vectors = encoder.encode(texts) if texts else _empty(encoder.dim)
+    return chunks, vectors
+
+
+def _worker_tokenize(batch):
+    """Tokenise a batch of ``(slot, text)``. Module level so it can be mapped."""
+    tokenizer = _WORKER_STATE["tokenizer"]
+    limit = _limit_threads()
+    if limit is None:
+        return [(slot, tokenizer.terms(text)) for slot, text in batch]
+    with limit:
+        return [(slot, tokenizer.terms(text)) for slot, text in batch]
+
+
+def _empty(dim):
+    import numpy as _np
+
+    return _np.empty((0, dim), dtype=_np.float32)
 
 
 def _normalize_input(docs) -> list[tuple[str, str]]:
@@ -78,6 +140,7 @@ class Arara:
         lang: str = "pt",
         cache_dir: str | None = None,
         encoder: DenseEncoder | None = None,
+        workers: int | None = None,
     ) -> None:
         self.path = Path(path) if path is not None else None
         self.dense_model = dense_model
@@ -93,6 +156,8 @@ class Arara:
         self.tokenizer = Tokenizer(lang)
         self._encoder = encoder
         self._cache_dir = cache_dir
+        # None = pick automatically; 1 forces the sequential path.
+        self.workers = workers
 
         self._catalog: Catalog | MemCatalog = Catalog(self.path) if self.path else MemCatalog()
         self._vectors: VectorStore | MemVectorStore | None = None
@@ -200,8 +265,11 @@ class Arara:
             return 0
 
         t0 = time.perf_counter()
-        new_chunks: list[Chunk] = []
-        new_docs: list[int] = []
+        # Documents are registered in the parent: the catalog is not written
+        # from forked children.
+        doc_ids: list[str] = []
+        canonicals: list[str] = []
+        doc_indices: list[int] = []
         for doc_id, text in items:
             if self._catalog.has_document(doc_id):
                 self.delete_document(doc_id)
@@ -215,17 +283,28 @@ class Arara:
                 self._doc_index[doc_id] = di
                 self._doc_ids.append(doc_id)
                 self._doc_alive.append(True)
-            for chunk in self.chunker.split(doc_id, canonical):
-                new_chunks.append(chunk)
-                new_docs.append(di)
-        self.timings["chunk_s"] = time.perf_counter() - t0
+            doc_ids.append(doc_id)
+            canonicals.append(canonical)
+            doc_indices.append(di)
+
+        prepared = self._prepare_documents(doc_ids, canonicals)
+        self.timings["prepare_s"] = time.perf_counter() - t0
+
+        new_chunks: list[Chunk] = []
+        new_docs: list[int] = []
+        blocks: list[np.ndarray] = []
+        for (chunks, vectors), di in zip(prepared, doc_indices):
+            if not len(chunks):
+                continue
+            new_chunks.extend(chunks)
+            new_docs.extend([di] * len(chunks))
+            blocks.append(vectors)
         if not new_chunks:
             self.flush()
             return 0
 
         t0 = time.perf_counter()
-        vectors = self.encoder.encode([c.text for c in new_chunks], show_progress=show_progress)
-        self.timings["encode_s"] = time.perf_counter() - t0
+        vectors = np.concatenate(blocks, axis=0)
         if self._vectors is None:
             self._vectors = (
                 VectorStore(self.path, dim=vectors.shape[1])
@@ -247,6 +326,36 @@ class Arara:
         self.timings["bookkeeping_s"] = time.perf_counter() - t0
         self.flush()
         return len(new_chunks)
+
+    def _effective_workers(self, n_docs: int) -> int:
+        """How many processes to use for this batch."""
+        if self.workers is not None:
+            return max(1, int(self.workers))
+        if n_docs < PARALLEL_MIN_DOCS:
+            return 1
+        if "fork" not in mp.get_all_start_methods():
+            # A spawned child would have to re-import numpy and reload the
+            # weights in every worker; not worth it implicitly.
+            return 1
+        return max(1, min(os.cpu_count() or 1, DEFAULT_MAX_WORKERS))
+
+    def _prepare_documents(self, doc_ids, canonicals):
+        """Chunk and embed documents, in order, optionally across processes."""
+        jobs = list(zip(doc_ids, canonicals))
+        workers = self._effective_workers(len(jobs))
+        _WORKER_STATE["chunker"] = self.chunker
+        _WORKER_STATE["encoder"] = self.encoder
+        self.timings["workers"] = float(workers)
+        if workers <= 1:
+            return [_worker_prepare(job) for job in jobs]
+        chunksize = max(1, len(jobs) // (workers * 8))
+        ctx = mp.get_context("fork")
+        try:
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+                return list(pool.map(_worker_prepare, jobs, chunksize=chunksize))
+        except (OSError, RuntimeError):  # pragma: no cover - sandboxed hosts
+            # A pool that cannot start must not fail the ingest.
+            return [_worker_prepare(job) for job in jobs]
 
     def _place_slots(self, chunks, doc_idx, slots: np.ndarray) -> None:
         need = int(slots.max(initial=-1)) + 1
@@ -293,9 +402,11 @@ class Arara:
         shift every id after the first deletion.
         """
         t0 = time.perf_counter()
-        idx = BM25Index()
         n_slots = int(self._slot_doc.size)
-        terms: list[list[str]] = [[] for _ in range(n_slots)]
+
+        # Read the chunk text in the parent (the catalog is not shared with
+        # children), then tokenise; stemming is per-chunk, so it parallelises.
+        work: list[tuple[int, str]] = []
         for doc_id in self._doc_ids:
             if not self._doc_alive[self._doc_index[doc_id]]:
                 continue
@@ -304,7 +415,28 @@ class Arara:
             text = self._catalog.text_of(doc_id)
             for r in sorted(self._catalog.chunks_of(doc_id), key=lambda r: r.start):
                 if 0 <= r.slot < n_slots:
-                    terms[r.slot] = self.tokenizer.terms(text[r.start : r.end])
+                    work.append((r.slot, text[r.start : r.end]))
+
+        terms: list[list[str]] = [[] for _ in range(n_slots)]
+        workers = self._effective_workers(len(work))
+        _WORKER_STATE["tokenizer"] = self.tokenizer
+        if workers <= 1 or len(work) < PARALLEL_MIN_DOCS:
+            for slot, tok in _worker_tokenize(work):
+                terms[slot] = tok
+        else:
+            batches = [work[i : i + 512] for i in range(0, len(work), 512)]
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=min(workers, len(batches)), mp_context=mp.get_context("fork")
+                ) as pool:
+                    for part in pool.map(_worker_tokenize, batches):
+                        for slot, tok in part:
+                            terms[slot] = tok
+            except (OSError, RuntimeError):  # pragma: no cover - sandboxed hosts
+                for slot, tok in _worker_tokenize(work):
+                    terms[slot] = tok
+
+        idx = BM25Index()
         idx.add(terms)
         idx.finalize()
         self.timings["lexical_s"] = time.perf_counter() - t0
