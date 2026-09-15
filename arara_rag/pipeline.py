@@ -29,7 +29,8 @@ from .dense import (DEFAULT_DENSE_MODEL, DEFAULT_NANOE5_VARIANT, DenseEncoder,
                     build_encoder)
 from .fuse import rank_from_scores, reciprocal_rank_fusion
 from .lexical import BM25Index, CXM25Scorer
-from .store import Catalog, ChunkRecord, MemCatalog, MemVectorStore, VectorStore
+from .store import (DEFAULT_SCAN_BLOCK, Catalog, ChunkRecord, MemCatalog,
+                    MemVectorStore, VectorStore)
 from .text import Tokenizer
 from .types import Chunk, Hit
 
@@ -40,6 +41,26 @@ SearchMode = Literal["dense", "lexical", "hybrid", "hybrid_cxm25"]
 # the pool costs more than it saves.
 PARALLEL_MIN_DOCS = 64
 DEFAULT_MAX_WORKERS = 8
+
+# A scan smaller than this cannot amortise its own syscalls, so the resident
+# budget is clamped here rather than down to a single row.
+MIN_SCAN_BLOCK = 1024
+# BLAS scratch and the per-block index arrays that appear *during* a scan, and
+# are therefore not visible in the RSS reading taken just before it.
+SCAN_RSS_SLACK = 24 * 1024 * 1024
+
+
+def rss_bytes() -> int:
+    """Resident set size of this process, or 0 where /proc is unavailable."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:  # pragma: no cover - non-Linux
+        pass
+    return 0
+
 
 # Forked children inherit these; nothing is pickled except the work items and
 # the results. The catalog and vector store are never touched by a child.
@@ -161,6 +182,7 @@ class Arara:
         cache_dir: str | None = None,
         encoder: DenseEncoder | None = None,
         workers: int | None = None,
+        max_ram_mb: float | None = None,
     ) -> None:
         self.path = Path(path) if path is not None else None
         self.dense_model = dense_model
@@ -180,6 +202,10 @@ class Arara:
         self._cache_dir = cache_dir
         # None = pick automatically; 1 forces the sequential path.
         self.workers = workers
+        # Ceiling on the per-query vector working set. The corpus is scanned a
+        # block at a time and the pages are released afterwards, so resident
+        # memory does not grow with the index; this bounds the block.
+        self.max_ram_mb = max_ram_mb
 
         self._catalog: Catalog | MemCatalog = Catalog(self.path) if self.path else MemCatalog()
         self._vectors: VectorStore | MemVectorStore | None = None
@@ -194,7 +220,9 @@ class Arara:
         self._slot_start = np.empty(0, dtype=np.int32)
         self._slot_end = np.empty(0, dtype=np.int32)
         self._doc_ids: list[str] = []
-        self._doc_index: dict[str, int] = {}
+        # doc_id -> position. Built on first use rather than at open: a
+        # read-only server answers queries without ever needing it.
+        self._doc_index: dict[str, int] | None = None
         self._doc_alive: list[bool] = []
         self.timings: dict[str, float] = {}
 
@@ -206,26 +234,60 @@ class Arara:
     def persistent(self) -> bool:
         return self.path is not None
 
+    def _scan_block(self, dim: int) -> int:
+        """Rows a single scan step may hold resident.
+
+        Without a cap the default block is used. With ``max_ram_mb`` the block
+        is derived from what is left of the process ceiling *right now*, so the
+        budget shrinks as the process grows and the ceiling is never crossed by
+        the scan itself -- index data is dropped again page by page after each
+        step.
+        """
+        if self.max_ram_mb is None or dim <= 0:
+            return DEFAULT_SCAN_BLOCK
+        row_bytes = max(1, dim * np.dtype(np.float32).itemsize)
+        room = float(self.max_ram_mb) * 1024 * 1024 - rss_bytes() - SCAN_RSS_SLACK
+        return int(min(DEFAULT_SCAN_BLOCK, max(MIN_SCAN_BLOCK, room // row_bytes)))
+
+    def _retune_scan(self) -> None:
+        """Re-derive the scan block from the current footprint before a query."""
+        if self.max_ram_mb is None or not isinstance(self._vectors, VectorStore):
+            return
+        self._vectors.block = self._scan_block(self._vectors.dim)
+
+    def _doc_map(self) -> dict[str, int]:
+        """doc_id -> position in :attr:`_doc_ids`, materialised on demand."""
+        if self._doc_index is None:
+            self._doc_index = {d: i for i, d in enumerate(self._doc_ids)}
+        return self._doc_index
+
     def _reopen(self) -> None:
         """Rebuild slot bookkeeping from a catalog written by a previous run."""
-        doc_ids = self._catalog.document_ids()
-        if not doc_ids:
+        self._doc_ids = []
+        # rowid -> position, so the chunk table can be walked in slot order
+        # without a doc_id -> position dict for the whole corpus.
+        ord_of = np.full(self._catalog.max_doc_rowid() + 1, -1, dtype=np.int32)
+        for doc_ord, (rowid, doc_id) in enumerate(self._catalog.document_rowids()):
+            ord_of[rowid] = doc_ord
+            self._doc_ids.append(doc_id)
+        if not self._doc_ids:
             return
-        self._doc_ids = doc_ids
-        self._doc_index = {d: i for i, d in enumerate(doc_ids)}
-        self._doc_alive = [True] * len(doc_ids)
+        self._doc_alive = [True] * len(self._doc_ids)
         size = self._catalog.max_slot() + 1
         self._slot_doc = np.full(size, -1, dtype=np.int32)
         self._slot_ord = np.zeros(size, dtype=np.int32)
         self._slot_start = np.zeros(size, dtype=np.int32)
         self._slot_end = np.zeros(size, dtype=np.int32)
-        for row in self._catalog.slot_rows():
-            self._slot_doc[row.slot] = self._doc_index[row.doc_id]
+        for row, doc_rowid in self._catalog.slot_rows_indexed():
+            self._slot_doc[row.slot] = ord_of[doc_rowid]
             self._slot_ord[row.slot] = int(row.chunk_id.rsplit("#", 1)[-1])
             self._slot_start[row.slot] = row.start
             self._slot_end[row.slot] = row.end
+        del ord_of
         if size:
-            self._vectors = VectorStore(self.path)
+            self._vectors = VectorStore(
+                self.path, block=self._scan_block(self._catalog.vector_dim())
+            )
         if (self.path / "bm25_meta.json").exists():
             self._lex = BM25Index.load(self.path)
             self._lex_dirty = False
@@ -310,12 +372,13 @@ class Arara:
                 self.delete_document(doc_id)
             canonical = canonicalize(text)
             self._catalog.put_document(doc_id, canonical, self._metadata_for(doc_id, metadata))
-            if doc_id in self._doc_index:
-                di = self._doc_index[doc_id]
+            index = self._doc_map()
+            if doc_id in index:
+                di = index[doc_id]
                 self._doc_alive[di] = True
             else:
                 di = len(self._doc_ids)
-                self._doc_index[doc_id] = di
+                index[doc_id] = di
                 self._doc_ids.append(doc_id)
                 self._doc_alive.append(True)
             doc_ids.append(doc_id)
@@ -342,7 +405,8 @@ class Arara:
         vectors = np.concatenate(blocks, axis=0)
         if self._vectors is None:
             self._vectors = (
-                VectorStore(self.path, dim=vectors.shape[1])
+                VectorStore(self.path, dim=vectors.shape[1],
+                            block=self._scan_block(vectors.shape[1]))
                 if self.path is not None
                 else MemVectorStore(dim=vectors.shape[1])
             )
@@ -444,8 +508,8 @@ class Arara:
         # Read the chunk text in the parent (the catalog is not shared with
         # children), then tokenise; stemming is per-chunk, so it parallelises.
         work: list[tuple[int, str]] = []
-        for doc_id in self._doc_ids:
-            if not self._doc_alive[self._doc_index[doc_id]]:
+        for di, doc_id in enumerate(self._doc_ids):
+            if not self._doc_alive[di]:
                 continue
             if not self._catalog.has_document(doc_id):
                 continue
@@ -484,7 +548,7 @@ class Arara:
     # -- CRUD ---------------------------------------------------------------
     def delete_document(self, doc_id: str) -> bool:
         """Remove a document. Its chunks are tombstoned and its slots recycled."""
-        di = self._doc_index.get(doc_id)
+        di = self._doc_map().get(doc_id)
         if di is None or not self._doc_alive[di]:
             return False
         slots = self._catalog.delete_document(doc_id)
@@ -552,7 +616,9 @@ class Arara:
                 dst.unlink(missing_ok=True)
                 src.replace(dst)
         shutil.rmtree(staging, ignore_errors=True)
-        self._vectors = VectorStore(self.path)
+        self._vectors = VectorStore(
+            self.path, block=self._scan_block(self._catalog.vector_dim())
+        )
 
         records = []
         for s in range(self._slot_doc.size):
@@ -628,6 +694,7 @@ class Arara:
         ``where`` uses a MongoDB-like syntax:
         ``{"ano": {"$gte": 2020}, "tipo": {"$in": ["lei", "decreto"]}}``.
         """
+        self._retune_scan()
         allowed, mask, ok = self._prepare(where)
         if not ok:
             return []
@@ -680,6 +747,7 @@ class Arara:
         self, query: str, top_k: int = 10, mode: SearchMode = "hybrid", where: dict | None = None
     ) -> list[Hit]:
         """Like :meth:`search` but returns chunk-level hits without doc pooling."""
+        self._retune_scan()
         allowed, mask, ok = self._prepare(where)
         if not ok:
             return []
@@ -711,7 +779,7 @@ class Arara:
         out = {d: float("-inf") for d in ids}
         slots_of: dict[str, list[int]] = {}
         for d in ids:
-            di = self._doc_index.get(d)
+            di = self._doc_map().get(d)
             if di is None or not self._doc_alive[di]:
                 slots_of[d] = []
                 continue
@@ -780,6 +848,8 @@ class Arara:
             "tokenizer": self.tokenizer.backend,
             "chunk_mode": self.chunker.mode,
             "persistent": self.persistent,
+            "max_ram_mb": self.max_ram_mb,
+            "scan_block": getattr(self._vectors, "block", None),
             "path": str(self.path) if self.path else None,
             "timings": dict(self.timings),
         }

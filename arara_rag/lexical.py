@@ -12,10 +12,93 @@ Two scorers, used at different stages for a reason:
 from __future__ import annotations
 
 import json
+import mmap as _mmap
 
 import numpy as np
 
 from .text import Tokenizer
+
+
+class SortedVocab:
+    """Term -> id map kept on disk, read with a binary search.
+
+    A Python ``dict`` of terms costs on the order of 140 bytes per distinct
+    term -- 140 MB for a million-term corpus, held resident for the life of the
+    process. The same map as a sorted blob of UTF-8 terms plus offsets and ids
+    costs about 17 bytes per term, and the pages a lookup touches are clean and
+    evictable, so what stays resident is only what queries actually use.
+    """
+
+    __slots__ = ("_blob", "_offsets", "_ids", "_n")
+
+    def __init__(self, blob, offsets, ids) -> None:
+        self._blob = blob
+        self._offsets = offsets
+        self._ids = ids
+        self._n = int(offsets.shape[0]) - 1
+
+    def __len__(self) -> int:
+        return self._n
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._blob.nbytes + self._offsets.nbytes + self._ids.nbytes)
+
+    def _term_at(self, i: int) -> bytes:
+        return bytes(self._blob[int(self._offsets[i]) : int(self._offsets[i + 1])])
+
+    def get(self, term: str | bytes) -> int | None:
+        b = term.encode("utf-8") if isinstance(term, str) else term
+        lo, hi = 0, self._n
+        offsets, ids = self._offsets, self._ids
+        while lo < hi:
+            mid = (lo + hi) // 2
+            cur = bytes(
+                self._blob[int(offsets[mid]) : int(offsets[mid + 1])]
+            )
+            if cur == b:
+                return int(ids[mid])
+            if cur < b:
+                lo = mid + 1
+            else:
+                hi = mid
+        return None
+
+    def items(self):
+        for i in range(self._n):
+            yield self._term_at(i).decode("utf-8"), int(self._ids[i])
+
+    def to_dict(self) -> dict[str, int]:
+        return dict(self.items())
+
+    @classmethod
+    def build(cls, vocab: dict[str, int], directory) -> "SortedVocab":
+        from pathlib import Path
+
+        d = Path(directory)
+        terms = sorted(vocab)
+        encoded = [t.encode("utf-8") for t in terms]
+        offsets = np.zeros(len(terms) + 1, dtype=np.int64)
+        np.cumsum([len(e) for e in encoded], out=offsets[1:])
+        blob = np.frombuffer(b"".join(encoded), dtype=np.uint8)
+        ids = np.asarray([vocab[t] for t in terms], dtype=np.int32)
+        np.save(d / "bm25_vocab_offsets.npy", offsets)
+        np.save(d / "bm25_vocab_blob.npy", blob)
+        np.save(d / "bm25_vocab_ids.npy", ids)
+        return cls.from_directory(d)
+
+    @classmethod
+    def from_directory(cls, directory) -> "SortedVocab | None":
+        from pathlib import Path
+
+        d = Path(directory)
+        if not (d / "bm25_vocab_offsets.npy").exists():
+            return None
+        return cls(
+            np.load(d / "bm25_vocab_blob.npy", mmap_mode="r"),
+            np.load(d / "bm25_vocab_offsets.npy", mmap_mode="r"),
+            np.load(d / "bm25_vocab_ids.npy", mmap_mode="r"),
+        )
 
 
 class BM25Index:
@@ -33,6 +116,9 @@ class BM25Index:
         self._idf: np.ndarray | None = None
         self._avgdl: float = 1.0
         self._n_docs: int = 0
+        # Set by :meth:`load` when the postings are memory-mapped; a scan then
+        # drops the pages it touched so resident memory stays flat.
+        self.release_pages: bool = False
 
     def __len__(self) -> int:
         return self._n_docs
@@ -43,7 +129,8 @@ class BM25Index:
         for arr in (self._indptr, self._indices, self._data, self._idf):
             if arr is not None:
                 total += int(arr.nbytes)
-        return total
+        vocab = getattr(self._vocab, "nbytes", None)
+        return total + (int(vocab) if vocab else 0)
 
     def add(self, token_lists) -> None:
         if not isinstance(self._doc_lens, list):
@@ -51,6 +138,10 @@ class BM25Index:
             # and force a rebuild of the inverted index.
             self._doc_lens = list(self._doc_lens.tolist())
             self._indptr = None
+        if not isinstance(self._vocab, dict):
+            # A vocabulary loaded from disk is read-only; adding to it means
+            # rebuilding anyway, so materialise the dict and carry on.
+            self._vocab = self._vocab.to_dict()
         for terms in token_lists:
             ids = []
             for t in terms:
@@ -110,6 +201,24 @@ class BM25Index:
         self._doc_lens = lens  # type: ignore[assignment]
         return self
 
+    def _drop_postings_pages(self, lo: int, hi: int) -> None:
+        """madvise one term's posting slice back out of the resident set."""
+        if not self.release_pages or hi <= lo:
+            return
+        for arr in (self._indices, self._data):
+            handle = getattr(arr, "_mmap", None)
+            if handle is None or not hasattr(handle, "madvise"):
+                continue
+            page = _mmap.PAGESIZE
+            itemsize = np.dtype(arr.dtype).itemsize
+            start = (lo * itemsize) // page * page
+            stop = min(((hi * itemsize) + page - 1) // page * page, arr.nbytes)
+            if stop > start:
+                try:
+                    handle.madvise(_mmap.MADV_DONTNEED, start, stop - start)
+                except (OSError, ValueError):  # pragma: no cover - platform
+                    pass
+
     def score_all(self, terms, mask: np.ndarray | None = None) -> np.ndarray:
         """BM25 score of every document, in index order.
 
@@ -134,6 +243,7 @@ class BM25Index:
             dl = self._doc_lens[docs]
             denom = tf + k1 * (1.0 - b + b * dl / avgdl)
             scores[docs] += self._idf[tid] * (tf * (k1 + 1.0)) / denom
+            self._drop_postings_pages(lo, hi)
         if mask is not None:
             scores = np.where(mask, scores, 0.0)
         return scores
@@ -168,6 +278,7 @@ class BM25Index:
         np.save(d / "bm25_data.npy", self._data)
         np.save(d / "bm25_idf.npy", self._idf)
         np.save(d / "bm25_doclen.npy", np.asarray(self._doc_lens, dtype=np.float32))
+        SortedVocab.build(dict(self._vocab), d)
         (d / "bm25_meta.json").write_text(
             json.dumps(
                 {
@@ -175,7 +286,7 @@ class BM25Index:
                     "b": self.b,
                     "avgdl": self._avgdl,
                     "n_docs": self._n_docs,
-                    "vocab": self._vocab,
+                    "n_terms": len(self._vocab),
                 }
             )
         )
@@ -193,6 +304,7 @@ class BM25Index:
         meta = json.loads((d / "bm25_meta.json").read_text())
         obj = cls(k1=meta["k1"], b=meta["b"])
         mode = "r" if mmap else None
+        obj.release_pages = bool(mmap)
         obj._indptr = np.load(d / "bm25_indptr.npy", mmap_mode=mode)
         obj._indices = np.load(d / "bm25_indices.npy", mmap_mode=mode)
         obj._data = np.load(d / "bm25_data.npy", mmap_mode=mode)
@@ -200,7 +312,10 @@ class BM25Index:
         obj._doc_lens = np.load(d / "bm25_doclen.npy", mmap_mode=mode)
         obj._avgdl = float(meta["avgdl"])
         obj._n_docs = int(meta["n_docs"])
-        obj._vocab = {k: int(v) for k, v in meta["vocab"].items()}
+        vocab = SortedVocab.from_directory(d)
+        if vocab is None:  # index written before the vocabulary moved to disk
+            vocab = {k: int(v) for k, v in meta["vocab"].items()}
+        obj._vocab = vocab
         return obj
 
 

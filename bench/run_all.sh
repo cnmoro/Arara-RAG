@@ -11,4 +11,6 @@ echo "================ retrieval suites () ================"
 .venv/bin/python -m bench.run --suite all
 echo "================ reranking () ================"
 .venv/bin/python -m bench.rerank
+echo "================ serving memory () ================"
+.venv/bin/python bench/ramcheck.py run 10000 40000 100000
 echo "================ done ================"

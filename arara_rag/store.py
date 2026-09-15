@@ -17,10 +17,12 @@ without a path keeps working without touching the disk.
 from __future__ import annotations
 
 import json
+import mmap as _mmap
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -31,6 +33,12 @@ import numpy as np
 # and the queries are an order of magnitude faster; that is the right trade.
 VECTOR_DTYPE = np.float32
 _FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Rows of the vector matrix touched per scan step. The scan must never hold more
+# than this much of the corpus resident, or "out of core" is only a claim about
+# the file format. 16k rows of 384 float32 is ~25 MB.
+DEFAULT_SCAN_BLOCK = 16384
+_PAGE = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +159,12 @@ class VectorStore:
     list, so the file grows with the live corpus rather than with write volume.
     """
 
-    def __init__(self, directory: str | Path, dim: int | None = None, capacity: int = 8192):
+    def __init__(self, directory: str | Path, dim: int | None = None, capacity: int = 8192,
+                 block: int = DEFAULT_SCAN_BLOCK, release_pages: bool = True):
+        self.block = max(256, int(block))
+        # Dropping pages after each scan step is what keeps resident memory flat
+        # in corpus size; without it a full scan pulls the whole matrix in.
+        self.release_pages = bool(release_pages)
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "vectors.npy"
@@ -159,10 +172,13 @@ class VectorStore:
         if self.path.exists():
             self._matrix = np.load(self.path, mmap_mode="r+")
             self.dim = int(self._matrix.shape[1])
+            # Sequential readahead would pull in far more than the block we ask
+            # for; this scan is block-at-a-time and gains nothing from it.
+            self.capacity = int(self._matrix.shape[0])
+            self._advise(_mmap.MADV_RANDOM, 0, self.capacity)
             meta = json.loads(self.meta_path.read_text()) if self.meta_path.exists() else {}
             self._n = int(meta.get("n", self._matrix.shape[0]))
             self._free: list[int] = [int(x) for x in meta.get("free", [])]
-            self.capacity = int(self._matrix.shape[0])
             if dim is not None and int(dim) != self.dim:
                 raise ValueError(f"index was built with dim={self.dim}, got dim={dim}")
         else:
@@ -187,6 +203,22 @@ class VectorStore:
     @property
     def file_bytes(self) -> int:
         return int(self.capacity * self.dim * np.dtype(VECTOR_DTYPE).itemsize)
+
+    def _advise(self, option: int, first_row: int, last_row: int) -> None:
+        """madvise a row range, page-aligned. Silent where unsupported."""
+        handle = getattr(self._matrix, "_mmap", None)
+        if handle is None or not hasattr(handle, "madvise"):
+            return
+        row_bytes = self.dim * np.dtype(VECTOR_DTYPE).itemsize
+        lo = (first_row * row_bytes) & ~(_PAGE - 1)
+        hi = min((last_row * row_bytes + _PAGE - 1) & ~(_PAGE - 1),
+                 self.capacity * row_bytes)
+        if hi <= lo:
+            return
+        try:
+            handle.madvise(option, lo, hi - lo)
+        except (OSError, ValueError):    # pragma: no cover - platform dependent
+            pass
 
     def _grow(self, needed: int) -> None:
         if needed <= self.capacity:
@@ -255,7 +287,7 @@ class VectorStore:
         query: np.ndarray,
         top_k: int,
         allowed: np.ndarray | None = None,
-        block: int = 65536,
+        block: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Exact top-k cosine search, optionally restricted to ``allowed`` slots.
 
@@ -264,15 +296,32 @@ class VectorStore:
         both paths exist.
         """
         q = np.asarray(query, dtype=np.float32).reshape(-1)
+        block = int(block or self.block)
         if allowed is not None and allowed.size == 0:
             return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int64)
 
-        if allowed is not None and allowed.size < 0.25 * max(self._n, 1):
+        if allowed is not None and (allowed >= self._n).any():
+            allowed = allowed[allowed < self._n]
+            if allowed.size == 0:
+                return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int64)
+
+        # Gathering a few rows directly is cheaper than masking the whole scan,
+        # but only while "a few" fits in the resident budget. Anything larger
+        # goes through the streaming path, which never holds more than a block.
+        selective = allowed is not None and allowed.size < min(
+            0.25 * max(self._n, 1), 2 * block
+        )
+        if selective:
             sims = self.gather(allowed) @ q
             k = min(top_k, sims.shape[0])
             part = np.argpartition(-sims, k - 1)[:k] if k < sims.shape[0] else np.arange(sims.shape[0])
             order = np.argsort(-sims[part], kind="stable")
             return sims[part][order], allowed[part][order].astype(np.int64)
+
+        mask = None
+        if allowed is not None:
+            mask = np.zeros(self._n, dtype=bool)
+            mask[allowed] = True
 
         best_s = np.empty(0, dtype=np.float32)
         best_i = np.empty(0, dtype=np.int64)
@@ -281,8 +330,8 @@ class VectorStore:
             stop = min(start + block, n)
             sims = self._matrix[start:stop] @ q
             idx = np.arange(start, stop, dtype=np.int64)
-            if allowed is not None:
-                keep = np.isin(idx, allowed)
+            if mask is not None:
+                keep = mask[start:stop]
                 sims, idx = sims[keep], idx[keep]
             if sims.size == 0:
                 continue
@@ -294,12 +343,16 @@ class VectorStore:
                 cand_i = np.concatenate([best_i, cand_i])
             order = np.argsort(-cand_s, kind="stable")[:top_k]
             best_s, best_i = cand_s[order], cand_i[order]
+            if self.release_pages:
+                self._advise(_mmap.MADV_DONTNEED, start, stop)
         return best_s, best_i
 
     def flush(self) -> None:
         if hasattr(self._matrix, "flush"):
             self._matrix.flush()
-        self.meta_path.write_text(json.dumps({"n": self._n, "free": self._free}))
+        self.meta_path.write_text(
+            json.dumps({"n": self._n, "free": self._free, "dim": self.dim})
+        )
 
     def close(self) -> None:
         self.flush()
@@ -393,15 +446,58 @@ class Catalog:
         rows = self._conn.execute("SELECT slot FROM chunks").fetchall()
         return np.asarray([r[0] for r in rows], dtype=np.int64)
 
+    def vector_dim(self) -> int:
+        """Dimension recorded in the vector file, for reopening."""
+        meta = self.dir / "vectors.json"
+        if meta.exists():
+            dim = json.loads(meta.read_text()).get("dim")
+            if dim:
+                return int(dim)
+        matrix = self.dir / "vectors.npy"
+        if matrix.exists():
+            return int(np.load(matrix, mmap_mode="r").shape[1])
+        return 0
+
     def max_slot(self) -> int:
         row = self._conn.execute("SELECT MAX(slot) FROM chunks").fetchone()
         return int(row[0]) if row and row[0] is not None else -1
 
-    def slot_rows(self) -> list[ChunkRecord]:
-        rows = self._conn.execute(
+    def max_doc_rowid(self) -> int:
+        row = self._conn.execute("SELECT MAX(rowid) FROM docs").fetchone()
+        return int(row[0]) if row and row[0] is not None else -1
+
+    def slot_rows(self) -> Iterator[ChunkRecord]:
+        """Stream the chunk table: a million rows must not become a million
+        Python objects held at once while reopening an index."""
+        cursor = self._conn.execute(
             "SELECT chunk_id, doc_id, slot, start, end FROM chunks ORDER BY slot"
-        ).fetchall()
-        return [ChunkRecord(*r) for r in rows]
+        )
+        for row in cursor:
+            yield ChunkRecord(*row)
+
+    def document_rowids(self) -> Iterator[tuple[int, str]]:
+        """``(rowid, doc_id)`` for every document, in rowid order.
+
+        Same order as :meth:`document_ids`, but the rowid is carried along so
+        the caller can index documents without building a dict of every id.
+        """
+        for rowid, doc_id in self._conn.execute("SELECT rowid, id FROM docs ORDER BY rowid"):
+            yield int(rowid), doc_id
+
+    def slot_rows_indexed(self) -> Iterator[tuple[ChunkRecord, int]]:
+        """Like :meth:`slot_rows`, plus each chunk's document rowid.
+
+        Resolving the rowid in SQL keeps reopening O(chunks) with no in-Python
+        ``doc_id -> position`` dict for the whole corpus. Ordering by slot uses
+        the slot index, so there is no large sort either.
+        """
+        cursor = self._conn.execute(
+            "SELECT c.chunk_id, c.doc_id, c.slot, c.start, c.end, d.rowid "
+            "FROM chunks c JOIN docs d ON d.id = c.doc_id "
+            "ORDER BY c.slot"
+        )
+        for chunk_id, doc_id, slot, start, end, doc_rowid in cursor:
+            yield ChunkRecord(chunk_id, doc_id, slot, start, end), int(doc_rowid)
 
     def replace_chunks(self, records: Sequence[ChunkRecord]) -> None:
         self._conn.execute("DELETE FROM chunks")
@@ -562,6 +658,18 @@ class MemCatalog:
 
     def live_slots(self) -> np.ndarray:
         return np.asarray(sorted(self._slot_doc), dtype=np.int64)
+
+    def vector_dim(self) -> int:
+        """Dimension recorded in the vector file, for reopening."""
+        meta = self.dir / "vectors.json"
+        if meta.exists():
+            dim = json.loads(meta.read_text()).get("dim")
+            if dim:
+                return int(dim)
+        matrix = self.dir / "vectors.npy"
+        if matrix.exists():
+            return int(np.load(matrix, mmap_mode="r").shape[1])
+        return 0
 
     def max_slot(self) -> int:
         return max(self._slot_doc, default=-1)

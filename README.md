@@ -41,20 +41,49 @@ One CPU core, no GPU. Measured end to end with `python -m bench.profile`.
 
 | documents | index build | query p50 | query p95 | index size | peak RSS to serve |
 |---|---|---|---|---|---|
-| 1,000 | 3.1 s | **0.45 ms** | 0.54 ms | 1.8 MB | 472 MB |
-| 10,000 | 8.8 s | **0.86 ms** | 6.8 ms | 18 MB | 481 MB |
-| 50,000 | 33.8 s | **7.0 ms** | 8.0 ms | 91 MB | 553 MB |
+| 1,000 | 3.9 s | **0.44 ms** | 0.45 ms | 1.8 MB | 472 MB |
+| 10,000 | 8.3 s | **0.82 ms** | 3.3 ms | 18 MB | 479 MB |
+| 50,000 | 29 s | **6.3 ms** | 9.6 ms | 91 MB | 493 MB |
 
-- **~1,300–1,500 documents/second** to chunk, embed, tokenise and index —
+- **~1,600–1,900 documents/second** to chunk, embed, tokenise and index —
   chunking and embedding are per-document, so they run across processes.
-  A single process manages ~300/second.
+  A single process manages ~280/second, and the out-of-core build costs the
+  same as the in-memory one to within 10%.
 - **~1.8 KB per document** of index: 1.5 KB of vectors plus BM25 postings.
 - Query latency scales with corpus size because both retrievers score the whole
   corpus per query — that is what makes the ranking exact rather than
   approximate.
-- Peak RSS is dominated by a **~470 MB fixed cost** (Python, numpy, the
-  embedding model and the tokenizer tables); the corpus adds ~1.7 KB per
-  document on top. Vectors are memory-mapped, so cold pages can be evicted.
+
+### Memory to serve does not scale with the corpus
+
+Fifty times the documents costs **21 MB more, not fifty times more**: a
+50,000-document index serves in 493 MB, a 1,000-document one in 472. Everything
+corpus-shaped is memory-mapped, read a block at a time, and dropped again with
+`madvise(MADV_DONTNEED)` as soon as the block has been scored: the dense
+vectors, the BM25 postings, and the vocabulary (a sorted term blob read by
+binary search, because a Python dict of terms would cost ~140 bytes each).
+
+What is left is a fixed floor of about **445 MB**, measured by loading the
+stack one piece at a time:
+
+| | MB |
+|---|---|
+| Python + this package + numpy | 35 |
+| quantized embedding table (`safetensors`) | 52 |
+| XLM-R tokenizer tables (276,214 tokens) | 316 |
+
+The tokenizer is the whole story, and it is not something the corpus can
+change. On top of that floor, `max_ram_mb` sets a **hard ceiling on the whole
+process**: the scan block is re-derived from the live footprint before every
+query, so the process stops short of the budget rather than growing into it.
+
+```python
+arara = Arara(path="./indice", max_ram_mb=640)   # never exceeds 640 MB RSS
+```
+
+Squeeze it below roughly 500 MB and the scan has to fall back to its minimum
+block, which costs query speed but not correctness — the ranking is identical
+at every setting.
 
 ![Speed and memory](docs/scaling.png)
 
@@ -221,7 +250,7 @@ An index is read far more than it is written, so deletes are tombstones and
 freed slots are recycled on the next write.
 
 ```python
-arara = Arara(path="./indice", max_chunk_chars=2000)
+arara = Arara(path="./indice", max_chunk_chars=2000, max_ram_mb=512)
 
 arara.add_documents(docs, metadata={"ano": 2024})        # insert / replace
 arara.update_metadata("lei_1234", {"revisado": True})    # no re-embedding
@@ -233,6 +262,10 @@ arara.search(q, where={"tipo": {"$in": ["lei", "decreto"]}, "ano": {"$gte": 2020
 arara.search(q, where={"$or": [{"uf": "SP"}, {"uf": "RJ"}]})
 ```
 
+`max_ram_mb` is optional and only meaningful with `path=`; it bounds the index
+data a query may hold resident, not the ~445 MB interpreter and model floor
+(see above). Leave it unset to use the default 24 MB scan block.
+
 Supported per field: `$eq` (bare value), `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
 `$in`, `$nin`, `$exists`, `$contains`, `$startswith`, `$endswith`; plus
 top-level `$and` / `$or`. Field names are validated and values are bound as SQL
@@ -240,23 +273,26 @@ parameters, so a filter cannot inject SQL.
 
 ## Guarantees
 
-Enforced by 88 tests, not asserted in prose:
+Enforced by 120 tests, not asserted in prose:
 
 - every chunk is an **exact substring** of the canonical document, ordered and
   non-overlapping, with only whitespace between chunks — nothing is dropped;
 - **no chunk exceeds `max_chunk_chars`**, including on a 24,000-character line;
 - CRLF and LF inputs chunk **identically** and offsets still resolve;
 - the in-memory and on-disk paths return **identical rankings**;
+- capping the scan budget with `max_ram_mb` **never changes the ranking**, only
+  how much of the index is resident at once;
 - importing the package never imports `torch` or `onnxruntime`.
 
 ## Reproduce
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[bench,validate,dev]"
-python -m pytest tests/                 # 88 tests
+python -m pytest tests/                 # 120 tests
 python bench/validate_metrics.py        # metrics vs pytrec_eval
 ./bench/run_all.sh                      # every suite -> bench/results/
 python -m bench.profile                 # speed and memory -> docs/scaling.png
+python -m bench.ramcheck run 10000 40000 100000   # serving RSS vs corpus size
 python -m bench.charts                  # regenerate the figures
 python -m bench.leaderboard             # compare against MTEB-BR
 ```
@@ -271,7 +307,7 @@ arara_rag/
   store.py      memory-mapped vectors, SQLite catalog, filters
   pipeline.py   Arara: add / search / rerank / CRUD
 bench/          task loaders, metrics, suites, profiling, charts
-tests/          88 contract and correctness tests
+tests/          120 contract and correctness tests
 space/          Gradio demo
 ```
 

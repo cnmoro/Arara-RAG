@@ -185,11 +185,14 @@ def chart_profile(records: list[dict], reopened: list[dict] | None = None) -> No
         pts = sorted((r["documents"], r["rss_to_serve_mb"]) for r in reopened)
         xs, ys = zip(*pts)
         ax.plot(xs, ys, marker="o", markersize=5, linewidth=2.0, color=ACCENT, zorder=3)
-        base = ys[0]
-        ax.annotate(f"{base:.0f} MB fixed\n(python + numpy + model)",
-                    xy=(xs[0], base), xytext=(xs[0] * 1.3, base * 0.86),
-                    fontsize=8.5, color=MUTED,
-                    arrowprops=dict(arrowstyle="-", color=GRID, linewidth=1))
+        base, top = ys[0], ys[-1]
+        ax.annotate(
+            f"{base:.0f} to {top:.0f} MB\n{(top / base - 1):.1%} more for"
+            "\n50x the documents",
+            xy=(xs[-1], top), xytext=(xs[0] * 1.25, top * 0.72),
+            fontsize=8.5, color=MUTED,
+            arrowprops=dict(arrowstyle="-", color=GRID, linewidth=1),
+        )
         ax.set_ylim(0, max(ys) * 1.25)
     ax.set_xscale("log")
     ax.set_title("Memory to serve a reopened index", fontsize=12, color=INK,
@@ -198,7 +201,7 @@ def chart_profile(records: list[dict], reopened: list[dict] | None = None) -> No
     ax.set_ylabel("peak RSS (MB)", color=MUTED, fontsize=9)
 
     fig.suptitle(
-        "One core, low-millisecond queries, and a per-document cost under two kilobytes",
+        "One core, exact queries, and a serving footprint that mostly ignores corpus size",
         fontsize=14, color=INK, fontweight="bold", x=0.007, ha="left", y=1.06,
     )
     fig.tight_layout()
