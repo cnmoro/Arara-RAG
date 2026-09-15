@@ -11,6 +11,11 @@ import numpy as np
 
 DEFAULT_DENSE_MODEL = "cnmoro/static-nomic-384-pten-v2"
 
+# nanoE5.c bundles two 4-bit multilingual-e5-small builds. "enpt" is the
+# Portuguese-pruned one, which is the sensible default for this stack.
+NANOE5_VARIANTS = ("enpt", "original")
+DEFAULT_NANOE5_VARIANT = "enpt"
+
 
 class DenseEncoder:
     """Wraps a Model2Vec static embedding model (numpy only).
@@ -18,6 +23,8 @@ class DenseEncoder:
     A static model is a lookup table: encoding is tokenize-then-mean-pool, which
     is why it is orders of magnitude faster than a real encoder.
     """
+
+    backend = "static"
 
     def __init__(self, model_id: str = DEFAULT_DENSE_MODEL, cache_dir: str | None = None) -> None:
         from model2vec import StaticModel  # imported lazily to keep module import cheap
@@ -33,9 +40,84 @@ class DenseEncoder:
         )
         vecs = np.asarray(vecs, dtype=np.float32)
         # Defensive: some static models ship un-normalized; cosine needs unit rows.
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        np.divide(vecs, np.maximum(norms, 1e-12), out=vecs)
-        return vecs
+        return _l2(vecs)
+
+    def encode_query(self, texts, **kwargs) -> np.ndarray:
+        """Queries and documents share one space in a static model."""
+        return self.encode(texts, **kwargs)
+
+
+class NanoE5Encoder:
+    """nanoE5.c: 4-bit multilingual-e5-small in C. 384-d, query/passage aware.
+
+    Slower than a static lookup table, because it is a real transformer forward
+    pass, but still light: the 4-bit model is 24-72 MB, there is no PyTorch, no
+    ONNX and no BLAS, and the engine is a few tens of KB of C.
+
+    E5 models are asymmetric, so queries and documents are prefixed differently.
+    ``encode`` produces passage vectors and ``encode_query`` query vectors; using
+    the wrong one costs several points of retrieval quality.
+    """
+
+    backend = "nanoe5"
+
+    def __init__(
+        self,
+        model_id: str | None = None,
+        cache_dir: str | None = None,
+        variant: str = DEFAULT_NANOE5_VARIANT,
+        num_threads: int | None = None,
+    ) -> None:
+        try:
+            from nanoe5 import E5
+        except ImportError as exc:  # pragma: no cover - optional backend
+            raise ImportError(
+                "the nanoe5 backend needs the 'nanoe5' package "
+                "(pip install 'arara-rag[nanoe5]')"
+            ) from exc
+        if variant not in NANOE5_VARIANTS:
+            raise ValueError(f"unknown nanoe5 variant {variant!r}; expected {NANOE5_VARIANTS}")
+        self.variant = variant
+        self.model_id = f"nanoe5/{variant}"
+        self.model = E5(variant=variant, num_threads=num_threads)
+        self.dim = int(self.model.dim)
+
+    def encode(self, texts, batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
+        return _l2(np.atleast_2d(np.asarray(self.model.passage(list(texts)), dtype=np.float32)))
+
+    def encode_query(self, texts, **kwargs) -> np.ndarray:
+        return _l2(np.atleast_2d(np.asarray(self.model.query(list(texts)), dtype=np.float32)))
+
+
+def _l2(vecs: np.ndarray) -> np.ndarray:
+    """Row-normalise, so a dot product is a cosine."""
+    vecs = np.asarray(vecs, dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    np.divide(vecs, np.maximum(norms, 1e-12), out=vecs)
+    return vecs
+
+
+ENCODER_BACKENDS = {
+    "static": DenseEncoder,
+    "nanoe5": NanoE5Encoder,
+}
+
+
+def build_encoder(backend: str = "static", model_id: str | None = None,
+                  cache_dir: str | None = None, variant: str | None = None):
+    """Construct a dense encoder.
+
+    ``static``  - Model2Vec lookup table (default): fastest, smallest.
+    ``nanoe5``  - nanoE5.c 4-bit multilingual-e5-small: slower, stronger, still
+                  dependency-light and CPU-only.
+    """
+    if backend not in ENCODER_BACKENDS:
+        raise ValueError(
+            f"unknown dense backend {backend!r}; expected one of {sorted(ENCODER_BACKENDS)}"
+        )
+    if backend == "nanoe5":
+        return NanoE5Encoder(variant=variant or DEFAULT_NANOE5_VARIANT)
+    return DenseEncoder(model_id or DEFAULT_DENSE_MODEL, cache_dir=cache_dir)
 
 
 class DenseIndex:

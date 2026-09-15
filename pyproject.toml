@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arara-rag"
-version = "0.4.1"
+version = "0.5.0"
 description = "Portuguese-first, CPU-only retrieval: tinyzchunk chunking, static embeddings, BM25, rank fusion and CXM25 reranking. numpy only, out-of-core, with metadata filtering and CRUD."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Alternative dense backend: nanoE5.c, a 4-bit multilingual-e5-small in C.
+# Slower than the default static model, but stronger, and still CPU-only with
+# no PyTorch, no ONNX and no BLAS.
+nanoe5 = ["nanoe5>=0.3"]
 # The benchmark harness is the only thing that needs the heavy stack.
 bench = ["datasets>=2.19", "pyarrow", "huggingface_hub>=0.23", "matplotlib>=3.8"]
 validate = ["pytrec_eval-terrier>=0.5.6", "scikit-learn>=1.3"]

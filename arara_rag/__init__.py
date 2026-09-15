@@ -10,14 +10,22 @@ query path.
 """
 
 from .chunk import Chunker
-from .dense import DEFAULT_DENSE_MODEL, DenseEncoder, DenseIndex
+from .dense import (
+    DEFAULT_DENSE_MODEL,
+    DEFAULT_NANOE5_VARIANT,
+    ENCODER_BACKENDS,
+    DenseEncoder,
+    DenseIndex,
+    NanoE5Encoder,
+    build_encoder,
+)
 from .fuse import rank_from_scores, reciprocal_rank_fusion
 from .lexical import BM25Index, CXM25Scorer
 from .pipeline import Arara
 from .text import Tokenizer
 from .types import Chunk, Hit
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "Arara",
@@ -26,8 +34,12 @@ __all__ = [
     "Chunk",
     "Chunker",
     "DEFAULT_DENSE_MODEL",
+    "DEFAULT_NANOE5_VARIANT",
     "DenseEncoder",
     "DenseIndex",
+    "ENCODER_BACKENDS",
+    "NanoE5Encoder",
+    "build_encoder",
     "Hit",
     "Tokenizer",
     "rank_from_scores",

@@ -90,9 +90,11 @@ SUITES: dict[str, list[Experiment]] = {
 }
 
 # Chunk configurations keyed by the experiment's ``chunk`` field.
-def _build_index(task: RetrievalTask, chunk: str, max_chunk_chars: int) -> tuple[Arara, float, dict]:
+def _build_index(task: RetrievalTask, chunk: str, max_chunk_chars: int,
+                 encoder: str = "static") -> tuple[Arara, float, dict]:
     t0 = time.perf_counter()
-    arara = Arara(chunk_mode=chunk, max_chunk_chars=max_chunk_chars, candidate_k=DEPTH)
+    arara = Arara(chunk_mode=chunk, max_chunk_chars=max_chunk_chars, candidate_k=DEPTH,
+                  dense_backend=encoder)
     arara.add_documents({doc_id: d["text"] for doc_id, d in task.corpus.items()})
     arara.finalize()
     build_s = time.perf_counter() - t0
@@ -103,6 +105,7 @@ def run_experiment(
     exp: Experiment,
     cache: dict[tuple[str, str, int, str], tuple[Arara, float, dict]],
     task_cache: dict[str, RetrievalTask],
+    encoder: str = "static",
 ) -> dict:
     task_key = exp.task
     if task_key not in task_cache:
@@ -110,14 +113,14 @@ def run_experiment(
         task_cache[task_key] = TASK_LOADERS[task_key]()
     task = task_cache[task_key]
 
-    key = (task_key, exp.chunk, exp.max_chunk_chars)
+    key = (task_key, exp.chunk, exp.max_chunk_chars, encoder)
     if key not in cache:
         print(
             f"  building index  task={task_key} chunk={exp.chunk} "
-            f"docs={len(task.corpus)} ...",
+            f"encoder={encoder} docs={len(task.corpus)} ...",
             flush=True,
         )
-        cache[key] = _build_index(task, exp.chunk, exp.max_chunk_chars)
+        cache[key] = _build_index(task, exp.chunk, exp.max_chunk_chars, encoder)
         _, build_s, stats = cache[key]
         print(
             f"    -> {stats['chunks']} chunks in {build_s:.1f}s "
@@ -149,6 +152,7 @@ def run_experiment(
         "experiment": exp.name,
         "task": task_key,
         "chunk": exp.chunk,
+        "dense_backend": encoder,
         "mode": exp.mode,
         "dense_weight": exp.dense_weight,
         "lexical_weight": exp.lexical_weight,
@@ -174,7 +178,11 @@ def run_experiment(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="core", choices=sorted(SUITES) + ["all"])
-    ap.add_argument("--out", default=str(RESULTS_DIR))
+    ap.add_argument(
+        "--encoder", default="static", choices=["static", "nanoe5"],
+        help="dense backend: 'static' (Model2Vec, default) or 'nanoe5' (4-bit e5-small)",
+    )
+    ap.add_argument("--out", default=None, help="defaults to bench/results/<encoder>")
     ap.add_argument("--max-queries", type=int, default=None,
                     help="subsample queries (for smoke runs); reported in output")
     args = ap.parse_args()
@@ -187,7 +195,7 @@ def main() -> None:
     else:
         exps = list({e.name: e for e in exps}.values())
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.out) if args.out else RESULTS_DIR / args.encoder
     out_dir.mkdir(parents=True, exist_ok=True)
 
     task_cache: dict[str, RetrievalTask] = {}
@@ -200,7 +208,7 @@ def main() -> None:
             t = task_cache[exp.task]
             t.queries = dict(list(t.queries.items())[: args.max_queries])
             t.qrels = {q: v for q, v in t.qrels.items() if q in t.queries}
-        rec = run_experiment(exp, cache, task_cache)
+        rec = run_experiment(exp, cache, task_cache, args.encoder)
         if args.max_queries:
             rec["max_queries"] = args.max_queries
         records.append(rec)

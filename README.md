@@ -89,6 +89,42 @@ than of the retrieval:
 A retriever scoring 0.33 on Quati is therefore not "worse" than one scoring 0.71
 on FaQuADIR — the numbers are not comparable across rows, only within one.
 
+### Choosing a dense encoder
+
+Two backends ship. The default is a Model2Vec lookup table; [nanoE5.c](https://github.com/cnmoro/nanoe5.c)
+is an opt-in alternative — a 4-bit `multilingual-e5-small` in C, with no PyTorch,
+no ONNX and no BLAS. It is a real transformer forward pass, so it is slower, and
+it is a separate dependency:
+
+```bash
+pip install "arara-rag[nanoe5]"
+```
+```python
+Arara(dense_backend="nanoe5")                              # or "static", the default
+Arara(dense_backend="nanoe5", dense_variant="original")    # English-first build
+```
+
+It is meaningfully better, and it changes the shape of the results:
+
+| Task | static dense | nanoE5 dense | static hybrid | **nanoE5 hybrid** | lexical |
+|---|---|---|---|---|---|
+| BRTaxQAR (capped) | 0.2934 | 0.3423 | 0.3486 | **0.4180** | 0.4051 |
+| FaQuADIR | 0.7139 | 0.8314 | 0.8304 | 0.8906 | 0.8961 |
+| FaqBacenRetrieval | 0.3744 | 0.5858 | 0.4526 | **0.5659** | 0.4881 |
+| JurisTCU | 0.3887 | 0.4906 | 0.4890 | **0.5685** | 0.5378 |
+
+Two things follow. **Dense retrieval improves by 0.05–0.21 nDCG@10** — on
+FaqBacen that is a larger jump than the whole distance from BM25 to the
+leaderboard median. And **hybrid finally beats BM25**: with the static model,
+lexical alone won every task and the dense half was dead weight; with a real
+encoder, fusion wins three of four and ties FaQuADIR. That is the argument for
+hybrid retrieval, and it needed a dense model that carries its weight.
+
+The cost is indexing — nanoE5 windows anything past 512 tokens, so the penalty
+tracks chunk length: ~4× for short chunks, ~30× for 16k of them, and far more
+for a corpus of 2.5 kB chunks. Query latency is ~8 ms against 0.5–7 ms, since a
+query is one short sequence either way.
+
 CXM25 reranking on top of the hybrid adds **+0.018 to +0.077 nDCG@10** across
 these tasks for 1–6 ms per query (FaQuADIR: 0.8304 → **0.9078**,
 BRTaxQAR full documents: 0.4801 → **0.5091**).

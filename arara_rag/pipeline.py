@@ -25,7 +25,8 @@ from typing import Literal
 import numpy as np
 
 from .chunk import Chunker, canonicalize
-from .dense import DEFAULT_DENSE_MODEL, DenseEncoder
+from .dense import (DEFAULT_DENSE_MODEL, DEFAULT_NANOE5_VARIANT, DenseEncoder,
+                    build_encoder)
 from .fuse import rank_from_scores, reciprocal_rank_fusion
 from .lexical import BM25Index, CXM25Scorer
 from .store import Catalog, ChunkRecord, MemCatalog, MemVectorStore, VectorStore
@@ -131,6 +132,8 @@ class Arara:
         self,
         path: str | Path | None = None,
         dense_model: str = DEFAULT_DENSE_MODEL,
+        dense_backend: str = "static",
+        dense_variant: str | None = None,
         chunk_mode: str = "tinyzchunk",
         max_chunk_chars: int = 2500,
         min_chunk_chars: int = 100,
@@ -144,6 +147,8 @@ class Arara:
     ) -> None:
         self.path = Path(path) if path is not None else None
         self.dense_model = dense_model
+        self.dense_backend = dense_backend
+        self.dense_variant = dense_variant
         self.candidate_k = candidate_k
         self.rrf_k = rrf_k
         self.fusion_weights = fusion_weights
@@ -230,8 +235,21 @@ class Arara:
     @property
     def encoder(self) -> DenseEncoder:
         if self._encoder is None:
-            self._encoder = DenseEncoder(self.dense_model, cache_dir=self._cache_dir)
+            self._encoder = build_encoder(
+                self.dense_backend, self.dense_model,
+                cache_dir=self._cache_dir, variant=self.dense_variant,
+            )
         return self._encoder
+
+    def _encode_query(self, query: str) -> np.ndarray:
+        """Embed one query.
+
+        Asymmetric models (E5 and friends) encode queries and documents
+        differently, so this must not go through ``encode``.
+        """
+        enc = self.encoder
+        fn = getattr(enc, "encode_query", enc.encode)
+        return fn([query])[0]
 
     def __len__(self) -> int:
         """Number of live documents."""
@@ -601,7 +619,7 @@ class Arara:
 
         if mode in ("dense", "hybrid", "hybrid_cxm25") and self._vectors is not None:
             ds, didx = self._vectors.search(
-                self.encoder.encode([query])[0], self.candidate_k, allowed
+                self._encode_query(query), self.candidate_k, allowed
             )
             rankings.append([int(i) for i in didx])
             weights.append(self.fusion_weights[0])
@@ -648,7 +666,7 @@ class Arara:
             return []
         rankings: list[list[int]] = []
         if mode in ("dense", "hybrid", "hybrid_cxm25") and self._vectors is not None:
-            _, idx = self._vectors.search(self.encoder.encode([query])[0], top_k, allowed)
+            _, idx = self._vectors.search(self._encode_query(query), top_k, allowed)
             rankings.append([int(i) for i in idx])
         if mode in ("lexical", "hybrid", "hybrid_cxm25"):
             _, idx = self._lex.search(self.tokenizer.terms(query), top_k, mask=mask)
@@ -689,7 +707,7 @@ class Arara:
         if mode in ("lexical", "hybrid"):
             lex = self._lex.score_all(self.tokenizer.terms(query))
         if mode in ("dense", "hybrid") and self._vectors is not None:
-            dense = self._vectors.gather(flat) @ self.encoder.encode([query])[0]
+            dense = self._vectors.gather(flat) @ self._encode_query(query)
             dense_map = dict(zip(flat, (float(v) for v in dense)))
         if mode == "cxm25":
             if self._cxm25 is None:
@@ -734,7 +752,7 @@ class Arara:
             "chunks": self.n_chunks,
             "slots_allocated": int(self._slot_doc.size),
             "slot_bookkeeping_bytes": int(self._slot_doc.size * 16),
-            "dense_backend": "model2vec/numpy",
+            "dense_backend": self.dense_backend,
             "dense_model": self.dense_model,
             "vector_bytes": vector_bytes,
             "vector_file_bytes": file_bytes,
