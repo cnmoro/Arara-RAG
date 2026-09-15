@@ -5,7 +5,8 @@ dense retrieval, lexical retrieval, rank fusion and reranking — numpy only, no
 PyTorch, no ONNX Runtime, no FAISS.
 
 ```bash
-# Not on PyPI yet -- install from a checkout:
+# Not on PyPI yet -- install from the repository:
+git clone https://github.com/cnmoro/Arara-RAG.git && cd Arara-RAG
 pip install -e ".[bench]"
 ```
 

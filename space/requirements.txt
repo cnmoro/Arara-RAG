@@ -1,2 +1,2 @@
-arara-rag @ git+https://github.com/cnmoro/arara-rag.git
+arara-rag @ git+https://github.com/cnmoro/Arara-RAG.git
 gradio>=4.0

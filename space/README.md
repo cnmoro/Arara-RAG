@@ -16,5 +16,5 @@ Portuguese-first, CPU-only RAG retrieval. Paste documents, ask a question, and
 see the exact source span each result points at.
 
 Runs on CPU with no GPU and no PyTorch. See the
-[main repository](https://github.com/cnmoro/arara-rag) for benchmarks against
+[main repository](https://github.com/cnmoro/Arara-RAG) for benchmarks against
 MTEB-BR.
